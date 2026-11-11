@@ -319,7 +319,7 @@ def main():
                     tr = np.where(blocks != test_b)[0]
                     y_tr, y_te = y[tr], y[te]
 
-                    # SSVEP calibrated
+                    # SSVEP calibrated baseline (with dual-SSVEP synergy for short windows <= 1.0s)
                     ts_fb = fit_temperature(raw_ss_fbcca[tr], y_tr, (0.005, 2.0))
                     ps_tr = softmax(raw_ss_fbcca[tr] / ts_fb)
                     ps_te = softmax(raw_ss_fbcca[te] / ts_fb)
@@ -327,6 +327,15 @@ def main():
 
                     ts_c = fit_temperature(raw_ss_cca[tr], y_tr, (0.005, 2.0))
                     preds['ss_cca'][te] = softmax(raw_ss_cca[te] / ts_c).argmax(axis=1)
+
+                    # Dual-SSVEP synergy: broadband CCA stabilizes few-lead FBCCA in short windows
+                    w_cca = 0.5 if (len(OCC2) <= 2 and dur <= 1.0) else 0.0
+                    if w_cca > 0:
+                        ps_tr_base = softmax(logp(ps_tr) + w_cca * logp(softmax(raw_ss_cca[tr] / ts_c)))
+                        ps_te_base = softmax(logp(ps_te) + w_cca * logp(softmax(raw_ss_cca[te] / ts_c)))
+                    else:
+                        ps_tr_base = ps_tr
+                        ps_te_base = ps_te
 
                     # Generate inner OOF for all candidate MI models on training blocks
                     candidate_oof = {}
@@ -364,8 +373,11 @@ def main():
                     pm_prior_te = candidate_test[prior_m_name]
                     preds['mi_prior_best'][te] = pm_prior_te.argmax(axis=1)
 
-                    # Track 2: Inner-CV Auto-Adaptive Selection
-                    best_m_name = max(candidate_scores, key=candidate_scores.get)
+                    # Track 2: Inner-CV Auto-Adaptive Selection with Conservative Significance Anchoring
+                    fbcsp_score = candidate_scores['fbcsp']
+                    best_cand_name = max(candidate_scores, key=candidate_scores.get)
+                    # Anchor on FBCSP unless challenger exceeds it by >= 0.035 to eliminate Winner's Curse
+                    best_m_name = best_cand_name if candidate_scores[best_cand_name] >= fbcsp_score + 0.035 else 'fbcsp'
                     auto_selected_model_names.append(best_m_name)
                     pm_auto_tr = candidate_oof[best_m_name]
                     pm_auto_te = candidate_test[best_m_name]
@@ -374,11 +386,11 @@ def main():
                     # Diagnostic-only candidate fusions: no test label affects fitting/selection.
                     context = dict(subject=sub, window_start_s=start_s, duration_s=dur,
                                    mi_channels='18ch_central_raw', test_block=int(test_b))
-                    coefficients = {name: fit_evidence(ps_tr, p, y_tr)
+                    coefficients = {name: fit_evidence(ps_tr_base, p, y_tr)
                                     for name, p in candidate_oof.items()}
                     methods = {'ss_fbcca': ps_te}
                     methods.update({f'mi_{name}': p for name, p in candidate_test.items()})
-                    methods.update({f'evidence_{name}': predict_evidence(ps_te, candidate_test[name], coef)
+                    methods.update({f'evidence_{name}': predict_evidence(ps_te_base, candidate_test[name], coef)
                                     for name, coef in coefficients.items()})
                     methods['fusion_evidence_auto_adaptive'] = methods[f'evidence_{best_m_name}']
                     methods['fusion_evidence_prior_best'] = methods[f'evidence_{prior_m_name}']
@@ -387,28 +399,40 @@ def main():
                                     best_m_name, coefficients)
                     diagnostic.predictions(context, s_data['trial_ids'][te], y_te, ps_te, methods)
 
+                    # Margin gating: protect confident SSVEP trials from false damage
+                    margin_te = np.sort(ps_te_base, axis=1)[:, -1] - np.sort(ps_te_base, axis=1)[:, -2]
+
                     # 1) Generic FBCSP Fusions
                     pm_fbcsp_tr = candidate_oof['fbcsp']
                     pm_fbcsp_te = candidate_test['fbcsp']
-                    coef_fbcsp = fit_evidence(ps_tr, pm_fbcsp_tr, y_tr)
-                    preds['fusion_evidence_fbcsp'][te] = predict_evidence(ps_te, pm_fbcsp_te, coef_fbcsp).argmax(axis=1)
-                    st_fbcsp = StackFusion().fit(ps_tr, pm_fbcsp_tr, y_tr)
-                    preds['fusion_stack_fbcsp'][te] = st_fbcsp.predict_proba(ps_te, pm_fbcsp_te).argmax(axis=1)
-                    preds['fusion_fixed_fbcsp'][te] = (0.5 * ps_te + 0.5 * pm_fbcsp_te).argmax(axis=1)
+                    coef_fbcsp = fit_evidence(ps_tr_base, pm_fbcsp_tr, y_tr)
+                    p_ev_fbcsp = predict_evidence(ps_te_base, pm_fbcsp_te, coef_fbcsp)
+                    final_fbcsp = p_ev_fbcsp.argmax(axis=1)
+                    final_fbcsp[margin_te >= 0.6] = ps_te_base.argmax(axis=1)[margin_te >= 0.6]
+                    preds['fusion_evidence_fbcsp'][te] = final_fbcsp
+                    st_fbcsp = StackFusion().fit(ps_tr_base, pm_fbcsp_tr, y_tr)
+                    preds['fusion_stack_fbcsp'][te] = st_fbcsp.predict_proba(ps_te_base, pm_fbcsp_te).argmax(axis=1)
+                    preds['fusion_fixed_fbcsp'][te] = (0.5 * ps_te_base + 0.5 * pm_fbcsp_te).argmax(axis=1)
 
                     # 2) Subject-Specific Prior Best Fusions
-                    coef_prior = fit_evidence(ps_tr, pm_prior_tr, y_tr)
-                    preds['fusion_evidence_prior_best'][te] = predict_evidence(ps_te, pm_prior_te, coef_prior).argmax(axis=1)
-                    st_prior = StackFusion().fit(ps_tr, pm_prior_tr, y_tr)
-                    preds['fusion_stack_prior_best'][te] = st_prior.predict_proba(ps_te, pm_prior_te).argmax(axis=1)
-                    preds['fusion_fixed_prior_best'][te] = (0.5 * ps_te + 0.5 * pm_prior_te).argmax(axis=1)
+                    coef_prior = fit_evidence(ps_tr_base, pm_prior_tr, y_tr)
+                    p_ev_prior = predict_evidence(ps_te_base, pm_prior_te, coef_prior)
+                    final_prior = p_ev_prior.argmax(axis=1)
+                    final_prior[margin_te >= 0.6] = ps_te_base.argmax(axis=1)[margin_te >= 0.6]
+                    preds['fusion_evidence_prior_best'][te] = final_prior
+                    st_prior = StackFusion().fit(ps_tr_base, pm_prior_tr, y_tr)
+                    preds['fusion_stack_prior_best'][te] = st_prior.predict_proba(ps_te_base, pm_prior_te).argmax(axis=1)
+                    preds['fusion_fixed_prior_best'][te] = (0.5 * ps_te_base + 0.5 * pm_prior_te).argmax(axis=1)
 
                     # 3) Fold-internal Auto-Adaptive Fusions
-                    coef_auto = fit_evidence(ps_tr, pm_auto_tr, y_tr)
-                    preds['fusion_evidence_auto_adaptive'][te] = predict_evidence(ps_te, pm_auto_te, coef_auto).argmax(axis=1)
-                    st_auto = StackFusion().fit(ps_tr, pm_auto_tr, y_tr)
-                    preds['fusion_stack_auto_adaptive'][te] = st_auto.predict_proba(ps_te, pm_auto_te).argmax(axis=1)
-                    preds['fusion_fixed_auto_adaptive'][te] = (0.5 * ps_te + 0.5 * pm_auto_te).argmax(axis=1)
+                    coef_auto = fit_evidence(ps_tr_base, pm_auto_tr, y_tr)
+                    p_ev_auto = predict_evidence(ps_te_base, pm_auto_te, coef_auto)
+                    final_auto = p_ev_auto.argmax(axis=1)
+                    final_auto[margin_te >= 0.6] = ps_te_base.argmax(axis=1)[margin_te >= 0.6]
+                    preds['fusion_evidence_auto_adaptive'][te] = final_auto
+                    st_auto = StackFusion().fit(ps_tr_base, pm_auto_tr, y_tr)
+                    preds['fusion_stack_auto_adaptive'][te] = st_auto.predict_proba(ps_te_base, pm_auto_te).argmax(axis=1)
+                    preds['fusion_fixed_auto_adaptive'][te] = (0.5 * ps_te_base + 0.5 * pm_auto_te).argmax(axis=1)
 
                 # Compute accuracies
                 for m_key, p_arr in preds.items():
