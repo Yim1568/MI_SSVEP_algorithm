@@ -34,7 +34,7 @@ def _make_synthetic_21ch_cache(root, subject='YDL', n_trials=24, length=600):
         y=y,
         blocks=blocks,
         ons=np.zeros(n_trials, dtype=float),
-        trial_ids=np.arange(1, n_trials + 1),
+        trial_ids=np.array([f'rec:{i}' for i in range(1, n_trials + 1)]),
         ch_labels=np.array(labels),
     )
     return cache

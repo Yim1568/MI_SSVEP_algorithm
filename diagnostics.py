@@ -23,6 +23,13 @@ def write_manifest(out, args):
     }, indent=2, default=str), encoding='utf-8')
 
 
+def _normalize_trial_id(val):
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return str(val)
+
+
 class Diagnostics:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -78,7 +85,7 @@ class Diagnostics:
                 damages += harm
                 ss_count += ss_ok
                 correct_count += ok
-                self.trials.append(dict(context, method=method, trial_id=int(trial_ids[i]),
+                self.trials.append(dict(context, method=method, trial_id=_normalize_trial_id(trial_ids[i]),
                     target=target, prediction=pred, fbcca_prediction=baseline_labels[i],
                     correct=ok, correction=rescue, damage=harm,
                     **{f'p{c}':float(row[c]) for c in range(4)},
