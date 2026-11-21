@@ -16,6 +16,20 @@ python -m venv .venv
 
 先测试一个窗口：追加 `--subjects YDL --starts 0.5 --durations 0.5`。可指定 `--out-dir`，但必须是尚不存在的目录；默认生成独立时间戳目录，避免覆盖历史结果。
 
+### 等窗长生理偏移与解耦策略 (`--window-mode`)
+
+默认 `--window-mode sync` 保持原有同步窗口行为与导出列结构不变。可通过 `--window-mode` 启用生理延迟解耦与等窗长偏移模式：
+
+```powershell
+# 等长累积窗 + 等长 0.5s 连续分段及其跨段动态证据累积
+.venv/Scripts/python run_adaptive_fusion.py --cache-dir "<CACHE_DIR>" --window-mode all_equal
+# 支持的具体模式：sync | decoupled | equal_cumulative | equal_segmented | all_equal
+# 可调潜伏期与分段步长：--ssvep-latency 0.14 --mi-latency 0.50 --segment-step 0.5
+```
+
+- `equal_cumulative`：SSVEP `[0.14, 0.14+L]` 配对 MI `[0.50, 0.50+L]`（两模态有效窗长严格相等）。
+- `equal_segmented`：同时输出逐段独立结果 `equal_segmented_step`（如 `[0.14, 0.64]`+`[0.50, 1.00]`、`[0.64, 1.14]`+`[1.00, 1.50]`...）与跨段贝叶斯对数证据累积 `equal_segmented_accum`。
+
 缓存文件名为 `YDL_preprocessed.npz`、`YZL_preprocessed.npz`、`FHY_preprocessed.npz`。必需字段：`ds_epochs`（试次×时间×通道，250 Hz）、`y`（0–3，thumb/index/middle/little）、`blocks`、`trial_ids`、`ons`（降采样后的起点样本索引）、`ch_labels`。每个训练划分必须覆盖四类；缓存须包含足够窗口长度与所需通道。只加载可信缓存，原实现使用 `allow_pickle=True`。预处理生成器不在本仓库范围内。
 
 ## 项目入口

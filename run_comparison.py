@@ -9,15 +9,24 @@ Constraints strictly followed:
 6. Time windows: start at 0.0s and start at 0.5s.
 7. SSVEP leads: 3 leads [O1, Oz, O2] and 2 leads [O1, O2] (avoiding 9-lead ceiling).
 """
-import sys
 from runtime import arguments, windows
-from diagnostics import Diagnostics
-import json
+from windowing import (
+    accumulate_log_probs,
+    cca_scores,
+    covariance,
+    extract_dual_features,
+    fit_temperature,
+    format_window_span,
+    logp,
+    reference,
+    resolve_window_configs,
+    softmax,
+)
 import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from scipy import linalg, optimize, signal, special
+from scipy import linalg, optimize, special
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -39,51 +48,15 @@ MI_BROAD_BAND = (8, 30)
 MI_SUB_BANDS = [(8, 12), (12, 16), (16, 20), (20, 24), (24, 28), (28, 32)]
 ALL_MI_BANDS = [MI_BROAD_BAND] + MI_SUB_BANDS
 
-# Helper Functions
-def reference(n, fs, freq, harmonics=3):
-    t = np.arange(n) / fs
-    hs = [h for h in range(1, int(harmonics) + 1) if freq * h < fs / 2]
-    return np.column_stack([fun(2 * np.pi * freq * h * t) for h in hs for fun in [np.sin, np.cos]])
-
-def cca_scores(x, freqs, fs=250, harmonics=3):
-    x = np.asarray(x, float)
-    if x.ndim != 2 or len(x) < 3 or x.shape[1] < 1:
-        return np.zeros(len(freqs))
-    x = x - x.mean(0)
-    u, s, _ = linalg.svd(x, full_matrices=False)
-    u = u[:, s > max(float(s.max(initial=0)) * 1e-8, 1e-12)]
-    values = []
-    for f in freqs:
-        r = reference(len(x), fs, f, harmonics)
-        r -= r.mean(0)
-        q, sv, _ = linalg.svd(r, full_matrices=False)
-        q = q[:, sv > max(float(sv.max(initial=0)) * 1e-8, 1e-12)]
-        values.append(float(np.clip(linalg.svdvals(u.T @ q)[0], 0, 1)) if u.shape[1] and q.shape[1] else 0.0)
-    return np.array(values)
-
-def softmax(z):
-    return special.softmax(z, axis=1)
-
-def logp(p):
-    return np.log(np.clip(p, 1e-8, 1))
 
 def shrink(c, amount=0.1):
     c = np.asarray(c)
     n = c.shape[-1]
     return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / n
 
+
 def normtrace(c):
     return c / np.maximum(np.trace(c, axis1=-2, axis2=-1)[..., None, None], 1e-12)
-
-def covariance(x):
-    x = x - x.mean(0)
-    return x.T @ x / (len(x) - 1)
-
-def fit_temperature(z, y, bounds=(0.005, 8.0)):
-    def fun(logt):
-        return -np.mean(np.log(np.clip(softmax(z / np.exp(logt))[np.arange(len(y)), y], 1e-12, 1)))
-    opt = optimize.minimize_scalar(fun, bounds=np.log(bounds), method='bounded')
-    return float(np.exp(opt.x)) if opt.success else 1.0
 
 # Models
 class FBCSPLDAModel:
@@ -293,6 +266,152 @@ class SelectiveCorrection:
         p[switch] = pm[switch]
         return p
 
+def _init_comparison_preds(n_trials):
+    methods = (
+        'ss_cca', 'ss_fbcca', 'mi_fbcsp',
+        'fusion_fixed_cca', 'fusion_fixed_fbcca',
+        'fusion_evidence_cca', 'fusion_evidence_fbcca',
+        'fusion_evidence_anchored',
+        'fusion_gate_cca', 'fusion_gate_fbcca',
+        'fusion_stack_cca', 'fusion_stack_fbcca',
+        'fusion_feature_fbcsp_fbcca',
+        'fusion_selective_correction',
+    )
+    return {m: np.zeros((n_trials, 4)) for m in methods}
+
+
+def _calibrate_comparison_fold(covs, raw_ss_cca, raw_ss_fbcca, y, blocks, train_idx, test_idx):
+    mi_model = FBCSPLDAModel(k=8, reg=0.1).fit(covs[train_idx], y[train_idx])
+    test_mi_p = mi_model.predict_proba(covs[test_idx])
+
+    oof_mi_p = np.zeros((len(train_idx), 4))
+    train_blocks = blocks[train_idx]
+    for inner_b in np.unique(train_blocks):
+        inner_val_sub = np.where(train_blocks == inner_b)[0]
+        inner_tr_sub = np.where(train_blocks != inner_b)[0]
+        sub_mi_model = FBCSPLDAModel(k=8, reg=0.1).fit(covs[train_idx[inner_tr_sub]], y[train_idx[inner_tr_sub]])
+        oof_mi_p[inner_val_sub] = sub_mi_model.predict_proba(covs[train_idx[inner_val_sub]])
+
+    tm = fit_temperature(logp(oof_mi_p), y[train_idx], bounds=(0.25, 8.0))
+    ts_cca = fit_temperature(raw_ss_cca[train_idx], y[train_idx], bounds=(0.005, 2.0))
+    ts_fbcca = fit_temperature(raw_ss_fbcca[train_idx], y[train_idx], bounds=(0.005, 2.0))
+
+    s_sort_tr = np.sort(raw_ss_fbcca[train_idx], axis=1)
+    s_sort_te = np.sort(raw_ss_fbcca[test_idx], axis=1)
+    return {
+        'pm_tr': softmax(logp(oof_mi_p) / tm),
+        'pm_te': softmax(logp(test_mi_p) / tm),
+        'ps_cca_tr': softmax(raw_ss_cca[train_idx] / ts_cca),
+        'ps_cca_te': softmax(raw_ss_cca[test_idx] / ts_cca),
+        'ps_fbcca_tr': softmax(raw_ss_fbcca[train_idx] / ts_fbcca),
+        'ps_fbcca_te': softmax(raw_ss_fbcca[test_idx] / ts_fbcca),
+        'mi_feats_tr': mi_model.transform(covs[train_idx]),
+        'mi_feats_te': mi_model.transform(covs[test_idx]),
+        'ss_raw_tr': raw_ss_fbcca[train_idx],
+        'ss_raw_te': raw_ss_fbcca[test_idx],
+        'margin_tr': s_sort_tr[:, -1] - s_sort_tr[:, -2],
+        'margin_te': s_sort_te[:, -1] - s_sort_te[:, -2],
+    }
+
+
+def _accumulate_comparison_fold(seg_folds_prefix, y_tr):
+    if len(seg_folds_prefix) == 1:
+        return seg_folds_prefix[0]
+    pm_tr, pm_te, _ = accumulate_log_probs(
+        [f['pm_tr'] for f in seg_folds_prefix], [f['pm_te'] for f in seg_folds_prefix], y_tr)
+    ps_cca_tr, ps_cca_te, _ = accumulate_log_probs(
+        [f['ps_cca_tr'] for f in seg_folds_prefix], [f['ps_cca_te'] for f in seg_folds_prefix], y_tr)
+    ps_fbcca_tr, ps_fbcca_te, _ = accumulate_log_probs(
+        [f['ps_fbcca_tr'] for f in seg_folds_prefix], [f['ps_fbcca_te'] for f in seg_folds_prefix], y_tr)
+
+    ss_raw_tr = np.mean([f['ss_raw_tr'] for f in seg_folds_prefix], axis=0)
+    ss_raw_te = np.mean([f['ss_raw_te'] for f in seg_folds_prefix], axis=0)
+    s_sort_tr = np.sort(ss_raw_tr, axis=1)
+    s_sort_te = np.sort(ss_raw_te, axis=1)
+    return {
+        'pm_tr': pm_tr, 'pm_te': pm_te,
+        'ps_cca_tr': ps_cca_tr, 'ps_cca_te': ps_cca_te,
+        'ps_fbcca_tr': ps_fbcca_tr, 'ps_fbcca_te': ps_fbcca_te,
+        'mi_feats_tr': np.mean([f['mi_feats_tr'] for f in seg_folds_prefix], axis=0),
+        'mi_feats_te': np.mean([f['mi_feats_te'] for f in seg_folds_prefix], axis=0),
+        'ss_raw_tr': ss_raw_tr, 'ss_raw_te': ss_raw_te,
+        'margin_tr': s_sort_tr[:, -1] - s_sort_tr[:, -2],
+        'margin_te': s_sort_te[:, -1] - s_sort_te[:, -2],
+    }
+
+
+def _eval_comparison_fold(fd, y_tr, groups_tr, fold_preds, test_idx):
+    pm_tr, pm_te = fd['pm_tr'], fd['pm_te']
+    ps_cca_tr, ps_cca_te = fd['ps_cca_tr'], fd['ps_cca_te']
+    ps_fbcca_tr, ps_fbcca_te = fd['ps_fbcca_tr'], fd['ps_fbcca_te']
+
+    fold_preds['ss_cca'][test_idx] = ps_cca_te
+    fold_preds['ss_fbcca'][test_idx] = ps_fbcca_te
+    fold_preds['mi_fbcsp'][test_idx] = pm_te
+
+    fold_preds['fusion_fixed_cca'][test_idx] = FixedFusion(0.5).predict_proba(ps_cca_te, pm_te)
+    fold_preds['fusion_fixed_fbcca'][test_idx] = FixedFusion(0.5).predict_proba(ps_fbcca_te, pm_te)
+
+    fold_preds['fusion_evidence_cca'][test_idx] = EvidenceFusion().fit(ps_cca_tr, pm_tr, y_tr).predict_proba(ps_cca_te, pm_te)
+    fold_preds['fusion_evidence_fbcca'][test_idx] = EvidenceFusion().fit(ps_fbcca_tr, pm_tr, y_tr).predict_proba(ps_fbcca_te, pm_te)
+    fold_preds['fusion_evidence_anchored'][test_idx] = AnchoredEvidenceFusion(0.1).fit(ps_fbcca_tr, pm_tr, y_tr).predict_proba(ps_fbcca_te, pm_te)
+
+    fold_preds['fusion_gate_cca'][test_idx] = ReliabilityGate().fit(ps_cca_tr, pm_tr, y_tr).predict_proba(ps_cca_te, pm_te)
+    fold_preds['fusion_gate_fbcca'][test_idx] = ReliabilityGate().fit(ps_fbcca_tr, pm_tr, y_tr).predict_proba(ps_fbcca_te, pm_te)
+
+    fold_preds['fusion_stack_cca'][test_idx] = StackFusion().fit(ps_cca_tr, pm_tr, y_tr).predict_proba(ps_cca_te, pm_te)
+    fold_preds['fusion_stack_fbcca'][test_idx] = StackFusion().fit(ps_fbcca_tr, pm_tr, y_tr).predict_proba(ps_fbcca_te, pm_te)
+
+    ff_model = FeatureFusionModel(k=8, C=0.1).fit(fd['mi_feats_tr'], fd['ss_raw_tr'], y_tr)
+    fold_preds['fusion_feature_fbcsp_fbcca'][test_idx] = ff_model.predict_proba(fd['mi_feats_te'], fd['ss_raw_te'])
+
+    sc_model = SelectiveCorrection().fit(ps_fbcca_tr, pm_tr, y_tr, fd['margin_tr'], groups_tr)
+    fold_preds['fusion_selective_correction'][test_idx] = sc_model.predict_proba(ps_fbcca_te, pm_te, fd['margin_te'])
+
+
+def _record_comparison_outputs(fold_preds, l_key, occ_leads, meta, sub, y, blocks, trial_ids,
+                               all_results, trial_predictions, extended_meta):
+    n_trials = len(y)
+    for m_name, preds_arr in fold_preds.items():
+        pred_labels = preds_arr.argmax(axis=1)
+        acc = float(np.mean(pred_labels == y))
+        res_row = {'lead_config': l_key, 'leads': '+'.join(occ_leads)}
+        if extended_meta:
+            res_row.update({'window_mode': meta['window_mode'], 'scheme': meta['scheme']})
+        res_row.update({'window_start_s': meta['window_start_s'], 'duration_s': meta['duration_s']})
+        if extended_meta:
+            res_row.update({
+                'decision_time_s': meta['decision_time_s'],
+                'ssvep_window': meta['ssvep_window'],
+                'mi_window': meta['mi_window'],
+                'segment_index': meta['segment_index'],
+            })
+        res_row.update({
+            'subject': sub, 'method': m_name, 'accuracy': acc,
+            'correct_count': int(np.sum(pred_labels == y)), 'total_trials': n_trials,
+        })
+        all_results.append(res_row)
+
+        for ti in range(n_trials):
+            pred_row = {'lead_config': l_key}
+            if extended_meta:
+                pred_row.update({
+                    'window_mode': meta['window_mode'], 'scheme': meta['scheme'],
+                    'segment_index': meta['segment_index'], 'decision_time_s': meta['decision_time_s'],
+                })
+            pred_row.update({
+                'window_start_s': meta['window_start_s'], 'duration_s': meta['duration_s'],
+                'subject': sub, 'trial': int(trial_ids[ti]), 'block': int(blocks[ti]),
+                'target': int(y[ti]), 'target_name': CLASS_NAMES[y[ti]],
+                'method': m_name, 'prediction': int(pred_labels[ti]),
+                'prediction_name': CLASS_NAMES[pred_labels[ti]],
+                'correct': bool(pred_labels[ti] == y[ti]),
+                'p0': float(preds_arr[ti, 0]), 'p1': float(preds_arr[ti, 1]),
+                'p2': float(preds_arr[ti, 2]), 'p3': float(preds_arr[ti, 3]),
+            })
+            trial_predictions.append(pred_row)
+
+
 def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
     cache_dir = Path(cache_dir)
     out_dir = Path(out_dir)
@@ -308,20 +427,12 @@ def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
             'blocks': data['blocks'],
             'trial_ids': data['trial_ids'],
             'ons': data['ons'],
-            'ch_labels': list(data['ch_labels'])
+            'ch_labels': list(data['ch_labels']),
         }
 
-    # SSVEP Lead sets to evaluate:
-    lead_configs = {
-        '3leads': ['O1', 'Oz', 'O2'],
-        '2leads': ['O1', 'O2']
-    }
-
-    # Window configurations
-    window_configs = window_configs or [
-        {'name': 'start00', 'start_s': 0.0, 'durations': [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]},
-        {'name': 'start05', 'start_s': 0.5, 'durations': [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]}
-    ]
+    lead_configs = {'3leads': ['O1', 'Oz', 'O2'], '2leads': ['O1', 'O2']}
+    window_configs = window_configs or resolve_window_configs([0.0, 0.5], None, ('sync',))
+    extended_meta = any(wc.get('mode', 'sync') != 'sync' for wc in window_configs)
 
     all_results = []
     trial_predictions = []
@@ -335,229 +446,156 @@ def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
         print(f"==========================================")
 
         for w_conf in window_configs:
-            start_s = w_conf['start_s']
-            durations = w_conf['durations']
+            w_mode = w_conf.get('mode', 'sync')
             w_name = w_conf['name']
-            print(f"\n--- Window Start: {start_s}s ({w_name}) ---")
+            specs = w_conf.get('specs') or [
+                {
+                    'mode': 'sync', 'scheme': w_name,
+                    'window_start_s': w_conf['start_s'], 'duration_s': d, 'cum_duration_s': d,
+                    'decision_time_s': round(w_conf['start_s'] + d, 6),
+                    'ssvep_window': (w_conf['start_s'], round(w_conf['start_s'] + d, 6)),
+                    'mi_window': (w_conf['start_s'], round(w_conf['start_s'] + d, 6)),
+                    'segment_index': None,
+                }
+                for d in w_conf['durations']
+            ]
+            print(f"\n--- Window Mode: {w_mode} ({w_name}) ---")
 
-            for dur in durations:
-                print(f"  Evaluating duration: {dur:.1f}s ...", end='', flush=True)
-                dur_t0 = time.time()
+            if w_mode == 'equal_segmented':
+                n_segs = len(specs)
+                ss_lat = specs[0]['ssvep_latency_s']
+                mi_lat = specs[0]['mi_latency_s']
+                step_metas = [
+                    {
+                        'window_mode': 'equal_segmented_step', 'scheme': 'equal_segmented_step',
+                        'window_start_s': sp['window_start_s'], 'duration_s': sp['duration_s'],
+                        'decision_time_s': sp['decision_time_s'],
+                        'ssvep_window': format_window_span(sp['ssvep_window']),
+                        'mi_window': format_window_span(sp['mi_window']),
+                        'segment_index': sp['segment_index'],
+                    }
+                    for sp in specs
+                ]
+                accum_metas = [
+                    {
+                        'window_mode': 'equal_segmented_accum', 'scheme': 'equal_segmented_accum',
+                        'window_start_s': mi_lat, 'duration_s': sp['cum_duration_s'],
+                        'decision_time_s': sp['decision_time_s'],
+                        'ssvep_window': f"[{ss_lat:.2f}, {sp['ssvep_window'][1]:.2f}]",
+                        'mi_window': f"[{mi_lat:.2f}, {sp['mi_window'][1]:.2f}]",
+                        'segment_index': sp['segment_index'],
+                    }
+                    for sp in specs
+                ]
 
                 for sub in subjects:
+                    sub_t0 = time.time()
+                    print(f"  Evaluating {sub} ({n_segs} segments) ...", end='', flush=True)
                     s_data = loaded_data[sub]
-                    epochs = s_data['epochs']
-                    y = s_data['y']
-                    blocks = s_data['blocks']
-                    trial_ids = s_data['trial_ids']
-                    ons = s_data['ons']
-                    ch_labels = s_data['ch_labels']
-
-                    ci = [ch_labels.index(c) for c in CENTRAL]
-                    oi = [ch_labels.index(c) for c in occ_leads]
-
+                    y, blocks, ons = s_data['y'], s_data['blocks'], s_data['ons']
                     n_trials = len(y)
-                    # 1. Extract trial features for this window
-                    covs = np.zeros((n_trials, len(ALL_MI_BANDS), len(CENTRAL), len(CENTRAL)))
-                    raw_ss_cca = np.zeros((n_trials, 4))
-                    raw_ss_fbcca = np.zeros((n_trials, 4))
+                    seg_feats = [
+                        extract_dual_features(
+                            s_data['epochs'], ons, s_data['ch_labels'], occ_leads, CENTRAL,
+                            sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS,
+                            FB_WEIGHTS, NOMINAL_FREQUENCIES, FS, HARMONICS,
+                            segment_index=sp['segment_index'], extract_cca=True,
+                        )
+                        for sp in specs
+                    ]
+                    step_preds = [_init_comparison_preds(n_trials) for _ in range(n_segs)]
+                    accum_preds = [_init_comparison_preds(n_trials) for _ in range(n_segs)]
 
-                    for i in range(n_trials):
-                        ds = epochs[i]
-                        on = ons[i]
-                        w_start = int(round(on + start_s * FS))
-                        w_end = w_start + int(round(dur * FS))
-
-                        x_central = ds[w_start:w_end, ci]
-                        x_occ = ds[w_start:w_end, oi]
-
-                        # MI covariances for all bands
-                        for b_idx, band in enumerate(ALL_MI_BANDS):
-                            xf = signal.sosfiltfilt(signal.butter(4, band, fs=FS, btype='bandpass', output='sos'), x_central, axis=0)
-                            covs[i, b_idx] = covariance(xf)
-
-                        # SSVEP CCA
-                        raw_ss_cca[i] = cca_scores(x_occ, NOMINAL_FREQUENCIES, FS, HARMONICS)
-
-                        # SSVEP FBCCA
-                        fb_score = np.zeros(4)
-                        for b_idx, (lo, hi) in enumerate(FBCCA_BANDS):
-                            x_sub = signal.sosfiltfilt(signal.butter(4, [lo, hi], fs=FS, btype='bandpass', output='sos'), x_occ, axis=0)
-                            sub_scores = cca_scores(x_sub, NOMINAL_FREQUENCIES, FS, HARMONICS)
-                            fb_score += FB_WEIGHTS[b_idx] * (sub_scores ** 2)
-                        raw_ss_fbcca[i] = fb_score
-
-                    # 2. 8-Fold Cross-Validation (Leave-One-Block-Out)
-                    unique_blocks = np.unique(blocks)
-                    fold_preds = {m: np.zeros((n_trials, 4)) for m in [
-                        'ss_cca', 'ss_fbcca', 'mi_fbcsp',
-                        'fusion_fixed_cca', 'fusion_fixed_fbcca',
-                        'fusion_evidence_cca', 'fusion_evidence_fbcca',
-                        'fusion_evidence_anchored',
-                        'fusion_gate_cca', 'fusion_gate_fbcca',
-                        'fusion_stack_cca', 'fusion_stack_fbcca',
-                        'fusion_feature_fbcsp_fbcca',
-                        'fusion_selective_correction'
-                    ]}
-
-                    for test_b in unique_blocks:
+                    for test_b in np.unique(blocks):
                         test_idx = np.where(blocks == test_b)[0]
                         train_idx = np.where(blocks != test_b)[0]
+                        y_tr, groups_tr = y[train_idx], blocks[train_idx]
+                        fold_segs = []
+                        for k in range(n_segs):
+                            covs_k, raw_fb_k, raw_cca_k = seg_feats[k]
+                            fd_k = _calibrate_comparison_fold(
+                                covs_k, raw_cca_k, raw_fb_k, y, blocks, train_idx, test_idx,
+                            )
+                            fold_segs.append(fd_k)
+                            _eval_comparison_fold(fd_k, y_tr, groups_tr, step_preds[k], test_idx)
+                            fd_acc = _accumulate_comparison_fold(fold_segs, y_tr)
+                            _eval_comparison_fold(fd_acc, y_tr, groups_tr, accum_preds[k], test_idx)
 
-                        # Fit MI model on full train_idx
-                        mi_model = FBCSPLDAModel(k=8, reg=0.1).fit(covs[train_idx], y[train_idx])
-                        test_mi_p = mi_model.predict_proba(covs[test_idx])
+                    for k in range(n_segs):
+                        _record_comparison_outputs(
+                            step_preds[k], l_key, occ_leads, step_metas[k], sub, y,
+                            blocks, s_data['trial_ids'], all_results, trial_predictions, extended_meta,
+                        )
+                        _record_comparison_outputs(
+                            accum_preds[k], l_key, occ_leads, accum_metas[k], sub, y,
+                            blocks, s_data['trial_ids'], all_results, trial_predictions, extended_meta,
+                        )
+                    print(f" done ({time.time() - sub_t0:.1f}s)")
+                continue
 
-                        # Generate nested OOF for calibration and meta-model training
-                        oof_mi_p = np.zeros((len(train_idx), 4))
-                        train_blocks = blocks[train_idx]
-                        for inner_b in np.unique(train_blocks):
-                            inner_val_sub = np.where(train_blocks == inner_b)[0]
-                            inner_tr_sub = np.where(train_blocks != inner_b)[0]
-                            inner_val = train_idx[inner_val_sub]
-                            inner_tr = train_idx[inner_tr_sub]
-
-                            sub_mi_model = FBCSPLDAModel(k=8, reg=0.1).fit(covs[inner_tr], y[inner_tr])
-                            oof_mi_p[inner_val_sub] = sub_mi_model.predict_proba(covs[inner_val])
-
-                        # Temperature scaling for train OOF
-                        tm = fit_temperature(logp(oof_mi_p), y[train_idx], bounds=(0.25, 8.0))
-                        ts_cca = fit_temperature(raw_ss_cca[train_idx], y[train_idx], bounds=(0.005, 2.0))
-                        ts_fbcca = fit_temperature(raw_ss_fbcca[train_idx], y[train_idx], bounds=(0.005, 2.0))
-
-                        # Calibrated probabilities on train
-                        pm_tr = softmax(logp(oof_mi_p) / tm)
-                        ps_cca_tr = softmax(raw_ss_cca[train_idx] / ts_cca)
-                        ps_fbcca_tr = softmax(raw_ss_fbcca[train_idx] / ts_fbcca)
-
-                        # Margins for selective correction
-                        s_sort = np.sort(raw_ss_fbcca[train_idx], axis=1)
-                        margin_tr = s_sort[:, -1] - s_sort[:, -2]
-
-                        # Calibrated test probabilities
-                        pm_te = softmax(logp(test_mi_p) / tm)
-                        ps_cca_te = softmax(raw_ss_cca[test_idx] / ts_cca)
-                        ps_fbcca_te = softmax(raw_ss_fbcca[test_idx] / ts_fbcca)
-
-                        s_sort_te = np.sort(raw_ss_fbcca[test_idx], axis=1)
-                        margin_te = s_sort_te[:, -1] - s_sort_te[:, -2]
-
-                        # Record standalone predictions
-                        fold_preds['ss_cca'][test_idx] = ps_cca_te
-                        fold_preds['ss_fbcca'][test_idx] = ps_fbcca_te
-                        fold_preds['mi_fbcsp'][test_idx] = pm_te
-
-                        # Fixed Fusion (w=0.5)
-                        fold_preds['fusion_fixed_cca'][test_idx] = FixedFusion(0.5).predict_proba(ps_cca_te, pm_te)
-                        fold_preds['fusion_fixed_fbcca'][test_idx] = FixedFusion(0.5).predict_proba(ps_fbcca_te, pm_te)
-
-                        # Evidence Fusion
-                        ev_cca = EvidenceFusion().fit(ps_cca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_evidence_cca'][test_idx] = ev_cca.predict_proba(ps_cca_te, pm_te)
-
-                        ev_fbcca = EvidenceFusion().fit(ps_fbcca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_evidence_fbcca'][test_idx] = ev_fbcca.predict_proba(ps_fbcca_te, pm_te)
-
-                        # Anchored Evidence Fusion (with FBCCA)
-                        anch_fbcca = AnchoredEvidenceFusion(0.1).fit(ps_fbcca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_evidence_anchored'][test_idx] = anch_fbcca.predict_proba(ps_fbcca_te, pm_te)
-
-                        # Reliability Gate
-                        gate_cca = ReliabilityGate().fit(ps_cca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_gate_cca'][test_idx] = gate_cca.predict_proba(ps_cca_te, pm_te)
-
-                        gate_fbcca = ReliabilityGate().fit(ps_fbcca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_gate_fbcca'][test_idx] = gate_fbcca.predict_proba(ps_fbcca_te, pm_te)
-
-                        # Stacking
-                        stack_cca = StackFusion().fit(ps_cca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_stack_cca'][test_idx] = stack_cca.predict_proba(ps_cca_te, pm_te)
-
-                        stack_fbcca = StackFusion().fit(ps_fbcca_tr, pm_tr, y[train_idx])
-                        fold_preds['fusion_stack_fbcca'][test_idx] = stack_fbcca.predict_proba(ps_fbcca_te, pm_te)
-
-                        # Feature Fusion (FBCSP + FBCCA)
-                        mi_feats_tr = mi_model.transform(covs[train_idx])
-                        mi_feats_te = mi_model.transform(covs[test_idx])
-                        ff_model = FeatureFusionModel(k=8, C=0.1).fit(mi_feats_tr, raw_ss_fbcca[train_idx], y[train_idx])
-                        fold_preds['fusion_feature_fbcsp_fbcca'][test_idx] = ff_model.predict_proba(mi_feats_te, raw_ss_fbcca[test_idx])
-
-                        # Selective Correction
-                        sc_model = SelectiveCorrection().fit(ps_fbcca_tr, pm_tr, y[train_idx], margin_tr, blocks[train_idx])
-                        fold_preds['fusion_selective_correction'][test_idx] = sc_model.predict_proba(ps_fbcca_te, pm_te, margin_te)
-
-                    # Compute and record accuracies
-                    for m_name, preds_arr in fold_preds.items():
-                        pred_labels = preds_arr.argmax(axis=1)
-                        acc = float(np.mean(pred_labels == y))
-
-                        all_results.append({
-                            'lead_config': l_key,
-                            'leads': '+'.join(occ_leads),
-                            'window_start_s': start_s,
-                            'duration_s': dur,
-                            'subject': sub,
-                            'method': m_name,
-                            'accuracy': acc,
-                            'correct_count': int(np.sum(pred_labels == y)),
-                            'total_trials': n_trials
-                        })
-
-                        # Save individual trial predictions for audit
-                        for ti in range(n_trials):
-                            trial_predictions.append({
-                                'lead_config': l_key,
-                                'window_start_s': start_s,
-                                'duration_s': dur,
-                                'subject': sub,
-                                'trial': int(trial_ids[ti]),
-                                'block': int(blocks[ti]),
-                                'target': int(y[ti]),
-                                'target_name': CLASS_NAMES[y[ti]],
-                                'method': m_name,
-                                'prediction': int(pred_labels[ti]),
-                                'prediction_name': CLASS_NAMES[pred_labels[ti]],
-                                'correct': bool(pred_labels[ti] == y[ti]),
-                                'p0': float(preds_arr[ti, 0]),
-                                'p1': float(preds_arr[ti, 1]),
-                                'p2': float(preds_arr[ti, 2]),
-                                'p3': float(preds_arr[ti, 3])
-                            })
-
+            for sp in specs:
+                dur = sp['duration_s']
+                print(f"  Evaluating duration: {dur:.1f}s ...", end='', flush=True)
+                dur_t0 = time.time()
+                meta = {
+                    'window_mode': sp['mode'], 'scheme': sp['scheme'],
+                    'window_start_s': sp['window_start_s'], 'duration_s': dur,
+                    'decision_time_s': sp['decision_time_s'],
+                    'ssvep_window': format_window_span(sp['ssvep_window']),
+                    'mi_window': format_window_span(sp['mi_window']),
+                    'segment_index': '' if sp['segment_index'] is None else sp['segment_index'],
+                }
+                for sub in subjects:
+                    s_data = loaded_data[sub]
+                    y, blocks, ons = s_data['y'], s_data['blocks'], s_data['ons']
+                    covs, raw_ss_fbcca, raw_ss_cca = extract_dual_features(
+                        s_data['epochs'], ons, s_data['ch_labels'], occ_leads, CENTRAL,
+                        sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS,
+                        FB_WEIGHTS, NOMINAL_FREQUENCIES, FS, HARMONICS, extract_cca=True,
+                    )
+                    fold_preds = _init_comparison_preds(len(y))
+                    for test_b in np.unique(blocks):
+                        test_idx = np.where(blocks == test_b)[0]
+                        train_idx = np.where(blocks != test_b)[0]
+                        fd = _calibrate_comparison_fold(
+                            covs, raw_ss_cca, raw_ss_fbcca, y, blocks, train_idx, test_idx,
+                        )
+                        _eval_comparison_fold(fd, y[train_idx], blocks[train_idx], fold_preds, test_idx)
+                    _record_comparison_outputs(
+                        fold_preds, l_key, occ_leads, meta, sub, y,
+                        blocks, s_data['trial_ids'], all_results, trial_predictions, extended_meta,
+                    )
                 print(f" done ({time.time() - dur_t0:.1f}s)")
 
     df_results = pd.DataFrame(all_results)
     df_preds = pd.DataFrame(trial_predictions)
 
-    # Save full tables
     df_results.to_csv(out_dir / 'all_metrics.csv', index=False, encoding='utf-8-sig')
     df_preds.to_csv(out_dir / 'all_predictions.csv', index=False, encoding='utf-8-sig')
 
-    # Generate Pivot Summary Tables
     for l_key in lead_configs:
-        for w_conf in window_configs:
-            w_start = w_conf['start_s']
-            sub_df = df_results[(df_results['lead_config'] == l_key) & (df_results['window_start_s'] == w_start)]
-
-            pivot = sub_df.pivot_table(
-                index=['subject', 'duration_s'],
-                columns='method',
-                values='accuracy'
-            )
-            pivot.to_csv(out_dir / f'summary_{l_key}_start{int(w_start*10):02d}.csv', encoding='utf-8-sig')
-
-            # Also create mean across subjects
-            mean_pivot = sub_df.pivot_table(
-                index='duration_s',
-                columns='method',
-                values='accuracy',
-                aggfunc='mean'
-            )
-            mean_pivot.to_csv(out_dir / f'mean_summary_{l_key}_start{int(w_start*10):02d}.csv', encoding='utf-8-sig')
+        if not extended_meta:
+            for w_conf in window_configs:
+                w_start = w_conf['start_s']
+                sub_df = df_results[(df_results['lead_config'] == l_key) & (df_results['window_start_s'] == w_start)]
+                tag = w_conf['name']
+                sub_df.pivot_table(index=['subject', 'duration_s'], columns='method', values='accuracy').to_csv(
+                    out_dir / f'summary_{l_key}_{tag}.csv', encoding='utf-8-sig')
+                sub_df.pivot_table(index='duration_s', columns='method', values='accuracy', aggfunc='mean').to_csv(
+                    out_dir / f'mean_summary_{l_key}_{tag}.csv', encoding='utf-8-sig')
+        else:
+            for scheme_key, sub_df in df_results[df_results['lead_config'] == l_key].groupby('scheme'):
+                idx_cols = ['subject', 'segment_index', 'duration_s'] if scheme_key == 'equal_segmented_step' else ['subject', 'duration_s']
+                mean_idx = ['segment_index', 'duration_s'] if scheme_key == 'equal_segmented_step' else 'duration_s'
+                sub_df.pivot_table(index=idx_cols, columns='method', values='accuracy').to_csv(
+                    out_dir / f'summary_{l_key}_{scheme_key}.csv', encoding='utf-8-sig')
+                sub_df.pivot_table(index=mean_idx, columns='method', values='accuracy', aggfunc='mean').to_csv(
+                    out_dir / f'mean_summary_{l_key}_{scheme_key}.csv', encoding='utf-8-sig')
 
     print(f"\nAll evaluations complete in {time.time() - t_start:.1f}s!")
     print(f"Results saved to: {out_dir}")
 
+
 if __name__ == '__main__':
     args = arguments('comparison')
-    run_experiment(args.cache_dir, args.out_dir, args.subjects, windows(args))
+    run_experiment(args.cache_dir, args.out_dir, args.subjects, args.resolved_windows)

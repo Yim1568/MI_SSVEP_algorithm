@@ -1,5 +1,12 @@
 # 变更记录
 
+## 0.4.0 — 2026-11-18
+
+- **等窗长生理延迟偏移切窗与跨段动态证据累积 (`windowing.py`)**:
+  - 新增 `--window-mode` 参数（默认 `sync` 完全保持原有同步基线契约），支持 `decoupled`（决策点统一对齐）、`equal_cumulative`（等长累积窗：SSVEP `[0.14, 0.14+L]` 配对 MI `[0.50, 0.50+L]`）、`equal_segmented`（等长连续独立 0.5s 分段 `[0.14+(k-1)*0.5, 0.14+k*0.5]` 配对 `[0.50+(k-1)*0.5, 0.50+k*0.5]` 及其跨段贝叶斯对数证据动态累积 `equal_segmented_accum`），以及简写 `all_equal`。
+  - 新增 `--ssvep-latency`（默认 0.14s）、`--mi-latency`（默认 0.50s）、`--segment-step`（默认 0.50s）可配参数与精确整数采样对齐 `sample_bounds`，确保半采样点起点下各分段严格等长无缝拼接。
+  - 在 `run_adaptive_fusion.py`、`run_reduced_mi_leads.py`、`run_comparison.py` 中统一接入上述模式；`sync` 默认运行输出列名与计算方式 100% 保持不变。
+
 ## 0.3.0 — 2026-11-15
 
 - **双重嵌套 OOF 安全回退底线 (Nested OOF Dynamic Safe Floor)**: 针对少导联/稳态期 MI 信噪比下降引发的负迁移风险，在训练集内层 LOBO 交叉验证中以严格 OOF 方式评估多模态融合相比纯 FBCCA 的真实增益 `oof_gain`；当预估增益不足（`oof_gain < min_gain`）或候选 MI 模型准确率接近随机水平（`candidate_scores < min_mi_acc`）时，自动触发 Safe Floor 无损回退至纯 FBCCA 基准，彻底阻断负迁移风险。

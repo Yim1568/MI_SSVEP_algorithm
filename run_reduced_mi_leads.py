@@ -13,11 +13,22 @@ Across:
 import sys
 from runtime import arguments, windows
 from diagnostics import Diagnostics
+from windowing import (
+    accumulate_log_probs,
+    cca_scores,
+    covariance,
+    extract_dual_features,
+    fit_temperature,
+    format_window_span,
+    logp,
+    reference,
+    softmax,
+)
 import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from scipy import linalg, optimize, signal, special
+from scipy import linalg, optimize
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -54,44 +65,15 @@ MI_CHANNEL_CONFIGS = {
                          'FC1', 'FC2', 'FC5', 'FC6', 'CP1', 'CP2', 'CP5', 'CP6']
 }
 
-def reference(n, fs, freq, harmonics=3):
-    t = np.arange(n) / fs
-    hs = [h for h in range(1, int(harmonics) + 1) if freq * h < fs / 2]
-    return np.column_stack([fun(2 * np.pi * freq * h * t) for h in hs for fun in [np.sin, np.cos]])
-
-def cca_scores(x, freqs, fs=250, harmonics=3):
-    x = np.asarray(x, float)
-    if x.ndim != 2 or len(x) < 3 or x.shape[1] < 1:
-        return np.zeros(len(freqs))
-    x = x - x.mean(0)
-    u, s, _ = linalg.svd(x, full_matrices=False)
-    u = u[:, s > max(float(s.max(initial=0)) * 1e-8, 1e-12)]
-    values = []
-    for f in freqs:
-        r = reference(len(x), fs, f, harmonics)
-        r -= r.mean(0)
-        q, sv, _ = linalg.svd(r, full_matrices=False)
-        q = q[:, sv > max(float(sv.max(initial=0)) * 1e-8, 1e-12)]
-        values.append(float(np.clip(linalg.svdvals(u.T @ q)[0], 0, 1)) if u.shape[1] and q.shape[1] else 0.0)
-    return np.array(values)
-
-def softmax(z): return special.softmax(z, axis=1)
-def logp(p): return np.log(np.clip(p, 1e-8, 1))
-def covariance(x): return (x - x.mean(0)).T @ (x - x.mean(0)) / (len(x) - 1)
 
 def shrink(c, amount=0.1):
     c = np.asarray(c)
     n = c.shape[-1]
     return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / n
 
+
 def normtrace(c):
     return c / np.maximum(np.trace(c, axis1=-2, axis2=-1)[..., None, None], 1e-12)
-
-def fit_temperature(z, y, bounds=(0.005, 8.0)):
-    def fun(logt):
-        return -np.mean(np.log(np.clip(softmax(z / np.exp(logt))[np.arange(len(y)), y], 1e-12, 1)))
-    opt = optimize.minimize_scalar(fun, bounds=np.log(bounds), method='bounded')
-    return float(np.exp(opt.x)) if opt.success else 1.0
 
 # MI Models
 class FBPowerLDAModel:
@@ -204,7 +186,110 @@ def fit_evidence(ps, pm, y_t):
 def predict_evidence(ps, pm, coef):
     return softmax(coef[0]*logp(ps) + coef[1]*logp(pm) + coef[2:])
 
-def process_subject_window(sub, start_s, dur, cache_path, diagnostics_dir=None):
+def _calibrate_ssvep_fold(raw_ss_fbcca, y, tr, te):
+    ts_fb = fit_temperature(raw_ss_fbcca[tr], y[tr], (0.005, 2.0))
+    return ts_fb, softmax(raw_ss_fbcca[tr] / ts_fb), softmax(raw_ss_fbcca[te] / ts_fb)
+
+
+def _calibrate_reduced_mi_fold(covs, y, blocks, tr, te):
+    y_tr = y[tr]
+    train_blocks = blocks[tr]
+    candidate_oof, candidate_test, candidate_scores, candidate_temperatures = {}, {}, {}, {}
+    for m_key, m_cls in MI_CANDIDATES.items():
+        oof_m = np.zeros((len(tr), 4))
+        for in_b in np.unique(train_blocks):
+            in_val = np.where(train_blocks == in_b)[0]
+            in_tr = np.where(train_blocks != in_b)[0]
+            sub_m = m_cls().fit(covs[tr[in_tr]], y_tr[in_tr])
+            oof_m[in_val] = sub_m.predict_proba(covs[tr[in_val]])
+
+        tm_m = fit_temperature(logp(oof_m), y_tr, (0.25, 8.0))
+        pm_tr_m = softmax(logp(oof_m) / tm_m)
+        candidate_oof[m_key] = pm_tr_m
+        candidate_temperatures[m_key] = tm_m
+        candidate_scores[m_key] = float(np.mean(pm_tr_m.argmax(axis=1) == y_tr))
+
+        full_m = m_cls().fit(covs[tr], y_tr)
+        candidate_test[m_key] = softmax(logp(full_m.predict_proba(covs[te])) / tm_m)
+    return candidate_oof, candidate_test, candidate_scores, candidate_temperatures
+
+
+def _init_reduced_preds(n_trials):
+    return {
+        'fbcca': np.zeros(n_trials),
+        'mi': {m: np.zeros(n_trials) for m in MI_CANDIDATES},
+        'auto_mi': np.zeros(n_trials),
+        'auto_fusion': np.zeros(n_trials),
+    }
+
+
+def _eval_reduced_fold(ps_tr, ps_te, ts_fb, candidate_oof, candidate_test,
+                       candidate_scores, candidate_temperatures, y_tr, y_te,
+                       trial_ids_te, context, diagnostic, pred_buf, te):
+    pred_buf['fbcca'][te] = ps_te.argmax(axis=1)
+    for m_key, pm_te_m in candidate_test.items():
+        pred_buf['mi'][m_key][te] = pm_te_m.argmax(axis=1)
+
+    best_m_name = max(candidate_scores, key=candidate_scores.get)
+    pm_auto_tr = candidate_oof[best_m_name]
+    pm_auto_te = candidate_test[best_m_name]
+    pred_buf['auto_mi'][te] = pm_auto_te.argmax(axis=1)
+
+    coef = fit_evidence(ps_tr, pm_auto_tr, y_tr)
+    pred_buf['auto_fusion'][te] = predict_evidence(ps_te, pm_auto_te, coef).argmax(axis=1)
+
+    if diagnostic is not None:
+        coefficients = {name: fit_evidence(ps_tr, p, y_tr) for name, p in candidate_oof.items()}
+        methods = {'ss_fbcca': ps_te}
+        methods.update({f'mi_{name}': p for name, p in candidate_test.items()})
+        methods.update({f'evidence_{name}': predict_evidence(ps_te, candidate_test[name], c)
+                        for name, c in coefficients.items()})
+        methods['fusion_evidence_auto_adaptive'] = methods[f'evidence_{best_m_name}']
+        diagnostic.fold(context, candidate_scores, candidate_temperatures, ts_fb, best_m_name, coefficients)
+        diagnostic.predictions(context, trial_ids_te, y_te, ps_te, methods)
+
+
+def _build_reduced_record(meta, sub, ch_name, ch_list, pred_buf, y, extended_meta):
+    acc_fbcca = float(np.mean(pred_buf['fbcca'] == y))
+    acc_fusion = float(np.mean(pred_buf['auto_fusion'] == y))
+    rec = {}
+    if extended_meta:
+        rec.update({'window_mode': meta['window_mode'], 'scheme': meta['scheme']})
+    rec.update({'window_start_s': meta['window_start_s'], 'duration_s': meta['duration_s']})
+    if extended_meta:
+        rec.update({
+            'decision_time_s': meta['decision_time_s'],
+            'ssvep_window': meta['ssvep_window'],
+            'mi_window': meta['mi_window'],
+            'segment_index': meta['segment_index'],
+        })
+    rec.update({
+        'subject': sub,
+        'mi_channels': ch_name,
+        'n_mi_channels': len(ch_list),
+        'acc_fbcca_2leads': acc_fbcca,
+        'acc_mi_fbpower': float(np.mean(pred_buf['mi']['fbpower_lda'] == y)),
+        'acc_mi_fbcsp': float(np.mean(pred_buf['mi']['fbcsp'] == y)),
+        'acc_mi_rcsp': float(np.mean(pred_buf['mi']['rcsp'] == y)),
+        'acc_mi_tangent': float(np.mean(pred_buf['mi']['tangent_logreg'] == y)),
+        'acc_mi_auto_selected': float(np.mean(pred_buf['auto_mi'] == y)),
+        'acc_auto_evidence_fusion': acc_fusion,
+        'gain_vs_fbcca': acc_fusion - acc_fbcca,
+    })
+    return rec
+
+
+def _make_reduced_context(sub, meta, ch_name, test_b, extended_meta):
+    ctx = dict(subject=sub, window_start_s=meta['window_start_s'], duration_s=meta['duration_s'],
+               mi_channels=ch_name, test_block=int(test_b))
+    if extended_meta:
+        ctx.update(window_mode=meta['window_mode'], decision_time_s=meta['decision_time_s'],
+                   ssvep_window=meta['ssvep_window'], mi_window=meta['mi_window'],
+                   segment_index=meta['segment_index'])
+    return ctx
+
+
+def process_subject_spec(sub, spec, cache_path, diagnostics_dir=None, extended_meta=False):
     data = np.load(cache_path, allow_pickle=True)
     epochs = data['ds_epochs']
     y = data['y']
@@ -216,131 +301,201 @@ def process_subject_window(sub, start_s, dur, cache_path, diagnostics_dir=None):
     n_trials = len(y)
     unique_blocks = np.unique(blocks)
 
-    oi = [ch_labels.index(c) for c in OCC2]
-    all_mi_i = [ch_labels.index(c) for c in ALL_MI_CHANNELS]
+    ss_win = spec['ssvep_window']
+    mi_win = spec['mi_window']
+    covs_all, raw_ss_fbcca, _ = extract_dual_features(
+        epochs, ons, ch_labels, OCC2, ALL_MI_CHANNELS,
+        ss_win, mi_win, ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
+        NOMINAL_FREQUENCIES, FS, HARMONICS, extract_cca=False,
+    )
 
-    # Precompute SSVEP scores and ALL MI covariances
-    raw_ss_fbcca = np.zeros((n_trials, 4))
-    covs_all = np.zeros((n_trials, len(ALL_MI_BANDS), len(all_mi_i), len(all_mi_i)))
-
-    for i in range(n_trials):
-        ds = epochs[i]
-        on = ons[i]
-        w_start = int(round(on + start_s * FS))
-        w_end = w_start + int(round(dur * FS))
-
-        # SSVEP
-        x_occ = ds[w_start:w_end, oi]
-        fb_score = np.zeros(4)
-        for b_idx, (lo, hi) in enumerate(FBCCA_BANDS):
-            x_sub = signal.sosfiltfilt(signal.butter(4, [lo, hi], fs=FS, btype='bandpass', output='sos'), x_occ, axis=0)
-            fb_score += FB_WEIGHTS[b_idx] * (cca_scores(x_sub, NOMINAL_FREQUENCIES, FS, HARMONICS) ** 2)
-        raw_ss_fbcca[i] = fb_score
-
-        # ALL MI
-        x_mi_full = ds[w_start:w_end, all_mi_i]
-        for b_idx, band in enumerate(ALL_MI_BANDS):
-            xf = signal.sosfiltfilt(signal.butter(4, band, fs=FS, btype='bandpass', output='sos'), x_mi_full, axis=0)
-            covs_all[i, b_idx] = covariance(xf)
-
-    # SSVEP LOBO predictions
-    preds_fbcca = np.zeros(n_trials)
+    ssvep_folds = {}
     for test_b in unique_blocks:
         te = np.where(blocks == test_b)[0]
         tr = np.where(blocks != test_b)[0]
-        ts_fb = fit_temperature(raw_ss_fbcca[tr], y[tr], (0.005, 2.0))
-        preds_fbcca[te] = softmax(raw_ss_fbcca[te] / ts_fb).argmax(axis=1)
+        ssvep_folds[test_b] = _calibrate_ssvep_fold(raw_ss_fbcca, y, tr, te)
 
-    acc_fbcca = float(np.mean(preds_fbcca == y))
+    meta = {
+        'window_mode': spec['mode'],
+        'scheme': spec['scheme'],
+        'window_start_s': spec['window_start_s'],
+        'duration_s': spec['duration_s'],
+        'decision_time_s': spec['decision_time_s'],
+        'ssvep_window': format_window_span(ss_win),
+        'mi_window': format_window_span(mi_win),
+        'segment_index': '' if spec['segment_index'] is None else spec['segment_index'],
+    }
 
     records = []
-    # Iterate over MI channel configurations by submatrix slicing
     for ch_name, ch_list in MI_CHANNEL_CONFIGS.items():
         sub_idx = [ALL_MI_CHANNELS.index(c) for c in ch_list]
         covs = covs_all[:, :, sub_idx, :][:, :, :, sub_idx]
+        pred_buf = _init_reduced_preds(n_trials)
 
-        preds_mi = {m: np.zeros(n_trials) for m in MI_CANDIDATES}
-        preds_auto_mi = np.zeros(n_trials)
-        preds_auto_fusion = np.zeros(n_trials)
+        for test_b in unique_blocks:
+            te = np.where(blocks == test_b)[0]
+            tr = np.where(blocks != test_b)[0]
+            ts_fb, ps_tr, ps_te = ssvep_folds[test_b]
+            cand_oof, cand_test, cand_scores, cand_temps = _calibrate_reduced_mi_fold(covs, y, blocks, tr, te)
+            ctx = _make_reduced_context(sub, meta, ch_name, test_b, extended_meta)
+            _eval_reduced_fold(
+                ps_tr, ps_te, ts_fb, cand_oof, cand_test, cand_scores, cand_temps,
+                y[tr], y[te], trial_ids[te], ctx, diagnostic, pred_buf, te,
+            )
+
+        records.append(_build_reduced_record(meta, sub, ch_name, ch_list, pred_buf, y, extended_meta))
+
+    if diagnostic is not None:
+        diagnostic.save()
+    return records
+
+
+def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, extended_meta=True):
+    data = np.load(cache_path, allow_pickle=True)
+    epochs = data['ds_epochs']
+    y = data['y']
+    diagnostic = Diagnostics(diagnostics_dir) if diagnostics_dir is not None else None
+    trial_ids = data['trial_ids']
+    blocks = data['blocks']
+    ons = data['ons']
+    ch_labels = list(data['ch_labels'])
+    n_trials = len(y)
+    unique_blocks = np.unique(blocks)
+
+    specs = w_conf['specs']
+    n_segs = len(specs)
+    ss_lat = specs[0]['ssvep_latency_s']
+    mi_lat = specs[0]['mi_latency_s']
+
+    seg_features = [
+        extract_dual_features(
+            epochs, ons, ch_labels, OCC2, ALL_MI_CHANNELS,
+            sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
+            NOMINAL_FREQUENCIES, FS, HARMONICS, segment_index=sp['segment_index'], extract_cca=False,
+        )
+        for sp in specs
+    ]
+
+    ssvep_step = {test_b: [] for test_b in unique_blocks}
+    ssvep_accum = {test_b: [] for test_b in unique_blocks}
+    for test_b in unique_blocks:
+        te = np.where(blocks == test_b)[0]
+        tr = np.where(blocks != test_b)[0]
+        tr_ps_list, te_ps_list = [], []
+        for k in range(n_segs):
+            _, raw_fb_k, _ = seg_features[k]
+            ts_k, ps_tr_k, ps_te_k = _calibrate_ssvep_fold(raw_fb_k, y, tr, te)
+            ssvep_step[test_b].append((ts_k, ps_tr_k, ps_te_k))
+            tr_ps_list.append(ps_tr_k)
+            te_ps_list.append(ps_te_k)
+            if k == 0:
+                ssvep_accum[test_b].append((ts_k, ps_tr_k, ps_te_k))
+            else:
+                ps_acc_tr, ps_acc_te, ts_acc = accumulate_log_probs(tr_ps_list, te_ps_list, y[tr])
+                ssvep_accum[test_b].append((ts_acc, ps_acc_tr, ps_acc_te))
+
+    step_metas = [
+        {
+            'window_mode': 'equal_segmented_step',
+            'scheme': 'equal_segmented_step',
+            'window_start_s': sp['window_start_s'],
+            'duration_s': sp['duration_s'],
+            'decision_time_s': sp['decision_time_s'],
+            'ssvep_window': format_window_span(sp['ssvep_window']),
+            'mi_window': format_window_span(sp['mi_window']),
+            'segment_index': sp['segment_index'],
+        }
+        for sp in specs
+    ]
+    accum_metas = [
+        {
+            'window_mode': 'equal_segmented_accum',
+            'scheme': 'equal_segmented_accum',
+            'window_start_s': mi_lat,
+            'duration_s': sp['cum_duration_s'],
+            'decision_time_s': sp['decision_time_s'],
+            'ssvep_window': f"[{ss_lat:.2f}, {sp['ssvep_window'][1]:.2f}]",
+            'mi_window': f"[{mi_lat:.2f}, {sp['mi_window'][1]:.2f}]",
+            'segment_index': sp['segment_index'],
+        }
+        for sp in specs
+    ]
+
+    records = []
+    for ch_name, ch_list in MI_CHANNEL_CONFIGS.items():
+        sub_idx = [ALL_MI_CHANNELS.index(c) for c in ch_list]
+        step_bufs = [_init_reduced_preds(n_trials) for _ in range(n_segs)]
+        accum_bufs = [_init_reduced_preds(n_trials) for _ in range(n_segs)]
 
         for test_b in unique_blocks:
             te = np.where(blocks == test_b)[0]
             tr = np.where(blocks != test_b)[0]
             y_tr, y_te = y[tr], y[te]
-            train_blocks = blocks[tr]
+            mi_oof_lists = {m: [] for m in MI_CANDIDATES}
+            mi_test_lists = {m: [] for m in MI_CANDIDATES}
 
-            candidate_oof = {}
-            candidate_test = {}
-            candidate_scores = {}
-            candidate_temperatures = {}
+            for k in range(n_segs):
+                covs_all_k = seg_features[k][0]
+                covs_k = covs_all_k[:, :, sub_idx, :][:, :, :, sub_idx]
+                cand_oof_k, cand_test_k, cand_scores_k, cand_temps_k = _calibrate_reduced_mi_fold(
+                    covs_k, y, blocks, tr, te,
+                )
 
-            for m_key, m_cls in MI_CANDIDATES.items():
-                oof_m = np.zeros((len(tr), 4))
-                for in_b in np.unique(train_blocks):
-                    in_val = np.where(train_blocks == in_b)[0]
-                    in_tr = np.where(train_blocks != in_b)[0]
-                    sub_m = m_cls().fit(covs[tr[in_tr]], y_tr[in_tr])
-                    oof_m[in_val] = sub_m.predict_proba(covs[tr[in_val]])
+                ts_k, ps_tr_k, ps_te_k = ssvep_step[test_b][k]
+                ctx_step = _make_reduced_context(sub, step_metas[k], ch_name, test_b, extended_meta)
+                _eval_reduced_fold(
+                    ps_tr_k, ps_te_k, ts_k, cand_oof_k, cand_test_k, cand_scores_k, cand_temps_k,
+                    y_tr, y_te, trial_ids[te], ctx_step, diagnostic, step_bufs[k], te,
+                )
 
-                tm_m = fit_temperature(logp(oof_m), y_tr, (0.25, 8.0))
-                pm_tr_m = softmax(logp(oof_m) / tm_m)
-                candidate_oof[m_key] = pm_tr_m
-                candidate_temperatures[m_key] = tm_m
-                candidate_scores[m_key] = np.mean(pm_tr_m.argmax(axis=1) == y_tr)
+                for m_key in MI_CANDIDATES:
+                    mi_oof_lists[m_key].append(cand_oof_k[m_key])
+                    mi_test_lists[m_key].append(cand_test_k[m_key])
 
-                full_m = m_cls().fit(covs[tr], y_tr)
-                pm_te_m = softmax(logp(full_m.predict_proba(covs[te])) / tm_m)
-                candidate_test[m_key] = pm_te_m
-                preds_mi[m_key][te] = pm_te_m.argmax(axis=1)
+                if k == 0:
+                    acc_oof, acc_test, acc_scores, acc_temps = cand_oof_k, cand_test_k, cand_scores_k, cand_temps_k
+                else:
+                    acc_oof, acc_test, acc_scores, acc_temps = {}, {}, {}, {}
+                    for m_key in MI_CANDIDATES:
+                        pm_acc_tr, pm_acc_te, tm_acc = accumulate_log_probs(
+                            mi_oof_lists[m_key], mi_test_lists[m_key], y_tr,
+                        )
+                        acc_oof[m_key] = pm_acc_tr
+                        acc_test[m_key] = pm_acc_te
+                        acc_temps[m_key] = tm_acc
+                        acc_scores[m_key] = float(np.mean(pm_acc_tr.argmax(axis=1) == y_tr))
 
-            # Auto-selected best MI model on inner-CV
-            best_m_name = max(candidate_scores, key=candidate_scores.get)
-            pm_auto_tr = candidate_oof[best_m_name]
-            pm_auto_te = candidate_test[best_m_name]
-            preds_auto_mi[te] = pm_auto_te.argmax(axis=1)
+                ts_acc, ps_acc_tr, ps_acc_te = ssvep_accum[test_b][k]
+                ctx_acc = _make_reduced_context(sub, accum_metas[k], ch_name, test_b, extended_meta)
+                _eval_reduced_fold(
+                    ps_acc_tr, ps_acc_te, ts_acc, acc_oof, acc_test, acc_scores, acc_temps,
+                    y_tr, y_te, trial_ids[te], ctx_acc, diagnostic, accum_bufs[k], te,
+                )
 
-            # Auto Evidence Fusion
-            ts_fb = fit_temperature(raw_ss_fbcca[tr], y_tr, (0.005, 2.0))
-            ps_tr = softmax(raw_ss_fbcca[tr] / ts_fb)
-            ps_te = softmax(raw_ss_fbcca[te] / ts_fb)
-
-            coef = fit_evidence(ps_tr, pm_auto_tr, y_tr)
-            preds_auto_fusion[te] = predict_evidence(ps_te, pm_auto_te, coef).argmax(axis=1)
-            if diagnostic is not None:
-                context = dict(subject=sub, window_start_s=start_s, duration_s=dur,
-                               mi_channels=ch_name, test_block=int(test_b))
-                coefficients = {name: fit_evidence(ps_tr, p, y_tr)
-                                for name, p in candidate_oof.items()}
-                methods = {'ss_fbcca': ps_te}
-                methods.update({f'mi_{name}': p for name, p in candidate_test.items()})
-                methods.update({f'evidence_{name}': predict_evidence(ps_te, candidate_test[name], c)
-                                for name, c in coefficients.items()})
-                methods['fusion_evidence_auto_adaptive'] = methods[f'evidence_{best_m_name}']
-                diagnostic.fold(context, candidate_scores, candidate_temperatures, ts_fb,
-                                best_m_name, coefficients)
-                diagnostic.predictions(context, trial_ids[te], y_te, ps_te, methods)
-
-
-        rec = {
-            'window_start_s': start_s,
-            'duration_s': dur,
-            'subject': sub,
-            'mi_channels': ch_name,
-            'n_mi_channels': len(ch_list),
-            'acc_fbcca_2leads': acc_fbcca,
-            'acc_mi_fbpower': float(np.mean(preds_mi['fbpower_lda'] == y)),
-            'acc_mi_fbcsp': float(np.mean(preds_mi['fbcsp'] == y)),
-            'acc_mi_rcsp': float(np.mean(preds_mi['rcsp'] == y)),
-            'acc_mi_tangent': float(np.mean(preds_mi['tangent_logreg'] == y)),
-            'acc_mi_auto_selected': float(np.mean(preds_auto_mi == y)),
-            'acc_auto_evidence_fusion': float(np.mean(preds_auto_fusion == y)),
-        }
-        rec['gain_vs_fbcca'] = rec['acc_auto_evidence_fusion'] - rec['acc_fbcca_2leads']
-        records.append(rec)
+        for k in range(n_segs):
+            records.append(_build_reduced_record(step_metas[k], sub, ch_name, ch_list, step_bufs[k], y, extended_meta))
+            records.append(_build_reduced_record(accum_metas[k], sub, ch_name, ch_list, accum_bufs[k], y, extended_meta))
 
     if diagnostic is not None:
         diagnostic.save()
     return records
+
+
+def process_subject_window(sub, start_s, dur, cache_path, diagnostics_dir=None):
+    spec = {
+        'mode': 'sync',
+        'scheme': f'start{int(round(start_s * 10)):02d}',
+        'window_start_s': start_s,
+        'duration_s': dur,
+        'cum_duration_s': dur,
+        'decision_time_s': round(start_s + dur, 6),
+        'ssvep_window': (start_s, round(start_s + dur, 6)),
+        'mi_window': (start_s, round(start_s + dur, 6)),
+        'segment_index': None,
+        'segment_step_s': None,
+    }
+    return process_subject_spec(sub, spec, cache_path, diagnostics_dir, extended_meta=False)
+
 
 def main():
     args = arguments('reduced')
@@ -349,21 +504,32 @@ def main():
     cache_paths = {sub: cache_dir / f'{sub}_preprocessed.npz' for sub in subjects}
 
     window_configs = windows(args)
+    extended_meta = any(wc['mode'] != 'sync' for wc in window_configs)
 
-    tasks = []
+    jobs = []
     for w in window_configs:
-        for dur in w['durations']:
+        if w['mode'] == 'equal_segmented':
             for sub in subjects:
-                tasks.append((sub, w['start_s'], dur, cache_paths[sub]))
+                diag_dir = out_dir / 'diagnostics' / f"{sub}_{w['name']}"
+                jobs.append(delayed(process_subject_segmented)(
+                    sub, w, cache_paths[sub], diag_dir, extended_meta,
+                ))
+        else:
+            for sp in w['specs']:
+                for sub in subjects:
+                    if extended_meta:
+                        tag = f"{sub}_{sp['scheme']}_dur{sp['duration_s']}"
+                    else:
+                        tag = f"{sub}_start{sp['window_start_s']}_dur{sp['duration_s']}"
+                    diag_dir = out_dir / 'diagnostics' / tag
+                    jobs.append(delayed(process_subject_spec)(
+                        sub, sp, cache_paths[sub], diag_dir, extended_meta,
+                    ))
 
-    print(f"Launching {len(tasks)} tasks on {args.n_jobs} parallel CPU workers...")
+    print(f"Launching {len(jobs)} tasks on {args.n_jobs} parallel CPU workers...")
     t_start = time.time()
 
-    results = Parallel(n_jobs=args.n_jobs, verbose=10)(
-        delayed(process_subject_window)(sub, start_s, dur, p,
-            out_dir / 'diagnostics' / f'{sub}_start{start_s}_dur{dur}')
-        for sub, start_s, dur, p in tasks
-    )
+    results = Parallel(n_jobs=args.n_jobs, verbose=10)(jobs)
 
     all_results = [r for sublist in results for r in sublist]
     df = pd.DataFrame(all_results)
@@ -372,6 +538,7 @@ def main():
 
     print(f"\nAll evaluations complete in {time.time() - t_start:.1f}s!")
     print(f"Saved {len(df)} records to: {out_path}")
+
 
 if __name__ == '__main__':
     main()
