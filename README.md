@@ -30,6 +30,17 @@ python -m venv .venv
 - `equal_cumulative`：SSVEP `[0.14, 0.14+L]` 配对 MI `[0.50, 0.50+L]`（两模态有效窗长严格相等）。
 - `equal_segmented`：同时输出逐段独立结果 `equal_segmented_step`（如 `[0.14, 0.64]`+`[0.50, 1.00]`、`[0.64, 1.14]`+`[1.00, 1.50]`...）与跨段贝叶斯对数证据累积 `equal_segmented_accum`。
 
+### 个性化 MI 通道筛选 (`--mi-pool`, `--ch-select`)
+
+支持从感觉运动 3×7 网格 `CENTRAL_21`（含 `FCz / Cz / CPz` 中线及双侧精细手指区，与枕区 9 导零重叠）按被试外层训练折严防泄露地筛选 8–12 个个性化导联：
+
+```powershell
+.venv/Scripts/python run_adaptive_fusion.py --cache-dir "<CACHE_DIR>" `
+  --subjects S01 YDL --starts 0.5 --mi-pool central21 --ch-select rfe `
+  --ch-k-min 8 --ch-k-max 12 --ch-objective fusion_logloss --ch-scope subject_fold
+# 可选筛选算法：--ch-select none | rfe | ga | pso
+```
+
 缓存文件名为 `YDL_preprocessed.npz`、`YZL_preprocessed.npz`、`FHY_preprocessed.npz`。必需字段：`ds_epochs`（试次×时间×通道，250 Hz）、`y`（0–3，thumb/index/middle/little）、`blocks`、`trial_ids`、`ons`（降采样后的起点样本索引）、`ch_labels`。每个训练划分必须覆盖四类；缓存须包含足够窗口长度与所需通道。只加载可信缓存，原实现使用 `allow_pickle=True`。预处理生成器不在本仓库范围内。
 
 ## 项目入口

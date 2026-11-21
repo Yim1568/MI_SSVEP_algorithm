@@ -4,6 +4,12 @@ from datetime import datetime
 from pathlib import Path
 from diagnostics import write_manifest
 from windowing import VALID_WINDOW_MODES, resolve_window_configs
+from channel_selection import (
+    MI_POOLS,
+    VALID_CH_OBJECTIVES,
+    VALID_CH_SCOPES,
+    VALID_CH_SELECTORS,
+)
 
 
 def _valid_start(val):
@@ -37,6 +43,20 @@ def arguments(kind):
                         help='MI physiological latency onset in seconds (default: 0.50)')
     parser.add_argument('--segment-step', type=float, default=0.50,
                         help='Segment step in seconds for equal_segmented mode (default: 0.50)')
+    parser.add_argument('--mi-pool', choices=tuple(MI_POOLS), default='central18',
+                        help='MI electrode pool: central18 (legacy default) or central21 (3x7 sensorimotor)')
+    parser.add_argument('--ch-select', choices=VALID_CH_SELECTORS, default='none',
+                        help='Personalized MI channel selection method: none, rfe, ga, pso')
+    parser.add_argument('--ch-k-min', type=int, default=8,
+                        help='Minimum selected MI channels when --ch-select != none (default: 8)')
+    parser.add_argument('--ch-k-max', type=int, default=12,
+                        help='Maximum selected MI channels when --ch-select != none (default: 12)')
+    parser.add_argument('--ch-objective', choices=VALID_CH_OBJECTIVES, default='fusion_logloss',
+                        help='Channel selection optimization objective: fusion_logloss or mi_logloss')
+    parser.add_argument('--ch-scope', choices=VALID_CH_SCOPES, default='subject_fold',
+                        help='Channel selection scope: subject_fold (once per fold) or window_fold')
+    parser.add_argument('--ch-seed', type=int, default=42,
+                        help='Random seed for stochastic channel selectors GA/PSO (default: 42)')
     if kind == 'reduced':
         parser.add_argument('--n-jobs', type=int, default=6)
     args = parser.parse_args()
@@ -45,6 +65,9 @@ def arguments(kind):
         parser.error('durations must be in (0, 4] seconds')
     if args.segment_step <= 0 or args.segment_step > 4:
         parser.error('segment-step must be in (0, 4] seconds')
+    n_pool = len(MI_POOLS[args.mi_pool])
+    if not (2 <= args.ch_k_min <= args.ch_k_max <= n_pool):
+        parser.error(f'ch-k-min/max must satisfy 2 <= k_min <= k_max <= {n_pool} for mi-pool={args.mi_pool}')
     for sub in args.subjects:
         if not (args.cache_dir / f'{sub}_preprocessed.npz').is_file():
             parser.error(f'Missing cache for {sub}')

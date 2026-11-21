@@ -26,7 +26,23 @@ def write_manifest(out, args):
 class Diagnostics:
     def __init__(self, directory):
         self.directory = Path(directory)
-        self.folds, self.trials, self.blocks = [], [], []
+        self.folds, self.trials, self.blocks, self.channels = [], [], [], []
+
+    def channel_selection(self, context, selected_channels, n_pool,
+                          best_score, full_score, n_evals, method, objective, scope):
+        self.channels.append(dict(
+            context,
+            selected_channels='|'.join(selected_channels),
+            n_selected=len(selected_channels),
+            n_pool=int(n_pool),
+            best_score=float(best_score),
+            full_score=float(full_score),
+            score_delta=float(full_score - best_score),
+            n_evals=int(n_evals),
+            ch_method=method,
+            ch_objective=objective,
+            ch_scope=scope,
+        ))
 
     def fold(self, context, scores, temperatures, ss_temperature, selected, coefficients):
         ranked = sorted(scores, key=scores.get, reverse=True)
@@ -77,7 +93,8 @@ class Diagnostics:
         self.directory.mkdir(parents=True, exist_ok=True)
         for filename, rows in [('fold_diagnostics.csv', self.folds),
                                ('trial_predictions.csv', self.trials),
-                               ('block_metrics.csv', self.blocks)]:
+                               ('block_metrics.csv', self.blocks),
+                               ('channel_selection_diagnostics.csv', self.channels)]:
             if rows:
                 with (self.directory / filename).open('w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.DictWriter(f, fieldnames=list(rows[0]))

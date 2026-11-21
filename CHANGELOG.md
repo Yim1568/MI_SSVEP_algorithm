@@ -1,5 +1,13 @@
 # 变更记录
 
+## 0.5.0 — 2026-11-22
+
+- **CENTRAL_21 感觉运动全网格与折内个性化通道筛选 (`channel_selection.py`)**:
+  - 新增 `CENTRAL_21` 导联池（`FC5..FC6`、`C5..C6`、`CP5..CP6` 共 21 导，补全 `FCz/Cz/CPz` 中线导联且与枕区 `OCC_9` 零重叠），通过 `--mi-pool {central18,central21}` 切换（默认保持 `central18`）。
+  - 实现三种严格嵌套于外层训练折内的 8–12 导个性化筛选器（`--ch-select {none,rfe,ga,pso}`）：基于多频带 CSP 正向空间模式与 F-score 共识排名的 **Stability-RFE**、基数约束随机重置 **遗传算法 (GA)**、以及连续优先级排序投影 **粒子群 (PSO)**。
+  - 支持融合互补目标 `--ch-objective fusion_logloss`（80% OOF Anchored-Fusion Log-Loss + 20% MI Log-Loss）与纯运动目标 `mi_logloss`，支持 `--ch-scope {subject_fold,window_fold}` 作用域。
+  - 在 `diagnostics.py` 新增 `channel_selection_diagnostics.csv` 审计记录，并在 `run_adaptive_fusion.py` 扩展模式中导出未门控原始融合基准 `fusion_evidence_fbcsp_raw` / `fusion_evidence_auto_raw`。
+
 ## 0.4.0 — 2026-11-18
 
 - **等窗长生理延迟偏移切窗与跨段动态证据累积 (`windowing.py`)**:
