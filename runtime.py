@@ -3,7 +3,12 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from diagnostics import write_manifest
-from windowing import VALID_WINDOW_MODES, resolve_window_configs
+from windowing import (
+    VALID_FILTER_MODES,
+    VALID_MI_REREF_MODES,
+    VALID_WINDOW_MODES,
+    resolve_window_configs,
+)
 from channel_selection import (
     MI_POOLS,
     VALID_CH_OBJECTIVES,
@@ -57,6 +62,12 @@ def arguments(kind):
                         help='Channel selection scope: subject_fold (once per fold) or window_fold')
     parser.add_argument('--ch-seed', type=int, default=42,
                         help='Random seed for stochastic channel selectors GA/PSO (default: 42)')
+    parser.add_argument('--filter-mode', choices=VALID_FILTER_MODES, default='epoch_zerophase',
+                        help='Bandpass filtering mode: epoch_zerophase (default), causal, or window_zerophase')
+    parser.add_argument('--mi-reref', choices=VALID_MI_REREF_MODES, default='none',
+                        help='MI spatial re-referencing within the active MI channel subset: none (default) or subset_car')
+    parser.add_argument('--mi-decouple-ssvep', action='store_true',
+                        help='Orthogonally project out SSVEP harmonic subspace from MI slices')
     if kind == 'reduced':
         parser.add_argument('--n-jobs', type=int, default=6)
     args = parser.parse_args()

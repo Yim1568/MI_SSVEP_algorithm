@@ -1,4 +1,17 @@
-# 验证记录 — 2026-11-11
+# 验证记录 — 2026-11-23
+
+- Windows / Python 3.14.7；NumPy 2.5.4、SciPy 1.18.1、pandas 3.1.1、scikit-learn 1.9.1、pyriemann 0.11、joblib 1.6.0。
+- 全量单元测试与合成数据端到端测试（`.venv\Scripts\python.exe -m unittest discover -s tests -v`）：共运行 21 项测试全部通过（88.82s），无跳过或放宽断言。
+- 本次新增回归测试（`tests/test_signal_fixes.py`）覆盖：
+  - 缓存健壮性与窗口边界强校验（拒绝非法标签 `{0..3}` 外数值、`NaN`、缺失通道与越界时间窗）。
+  - 整段零相位滤波 `epoch_zerophase` 对短窗（0.10s / 25 点）无边界报错，以及单向因果 `causal` 模式对未来样本零泄露。
+  - 宽带 CCA（`(6, 45) Hz`）抗慢漂移验证、`project_out_ssvep` 正交剔除 10/20 Hz 谐波验证、以及信号域 `apply_subset_car` 与协方差域 `apply_cov_car` 等价恒等式验证。
+  - `FBPowerLDAModel` 与 `TangentLogRegModel` 子集内 `c / trace(c)` 缩放不变性、`RCSPModel` 4 导联 8 滤波器收敛性、及缺类 `align_proba_4class` 防护。
+  - `subject_fold` 通道选择结果与 `--durations` 传入组合及 `--starts` 顺序严格无关。
+  - `run_comparison.py` 中 `FeatureFusionModel` 折内 48 维固定槽位 OOF 特征提取与跨段特征平均对齐。
+- 本次未在真实参与者缓存上重跑全部窗口与全部被试；真实数据效果需在独立环境中复跑验证。
+
+# 历史验证记录 — 2026-11-11
 
 - Windows / Python 3.14.7；NumPy 2.5.4、SciPy 1.18.1、pandas 3.1.1、scikit-learn 1.9.1、pyriemann 0.11、joblib 1.6.0。
 - 单元测试覆盖并列、错位输入、纠错/破坏恒等式、输出目录不可覆盖和重复被试去重。

@@ -15,14 +15,18 @@ from runtime import arguments, windows
 from diagnostics import Diagnostics
 from windowing import (
     accumulate_log_probs,
+    align_proba_4class,
+    apply_cov_car,
     cca_scores,
     covariance,
     extract_dual_features,
+    fit_oof_temperature,
     fit_temperature,
     format_window_span,
     logp,
     reference,
     softmax,
+    validate_subject_cache,
 )
 import time
 from pathlib import Path
@@ -37,11 +41,11 @@ from pyriemann.tangentspace import TangentSpace
 from joblib import Parallel, delayed
 
 FS = 250
-HARMONICS = 3
+HARMONICS = 4
 NOMINAL_FREQUENCIES = [12.0, 10.0, 60.0 / 7.0, 7.5]
 CLASS_NAMES = ['thumb', 'index', 'middle', 'little']
 
-FBCCA_BANDS = [(6, 45), (10, 45), (14, 45), (18, 45), (22, 45)]
+FBCCA_BANDS = [(6, 45), (9, 45), (14, 45), (18, 45), (21, 45)]
 FB_WEIGHTS = np.arange(1, len(FBCCA_BANDS) + 1)**(-1.25) + 0.25
 
 MI_BROAD_BAND = (8, 30)
@@ -67,26 +71,33 @@ MI_CHANNEL_CONFIGS = {
 
 
 def shrink(c, amount=0.1):
-    c = np.asarray(c)
+    c = np.asarray(c, dtype=float)
     n = c.shape[-1]
-    return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / n
+    return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / max(n, 1)
 
 
 def normtrace(c):
     return c / np.maximum(np.trace(c, axis1=-2, axis2=-1)[..., None, None], 1e-12)
 
+
 # MI Models
 class FBPowerLDAModel:
+    @staticmethod
+    def _features(covs):
+        c_sub = normtrace(covs[:, 1:])
+        return np.log(np.maximum(np.diagonal(c_sub, axis1=-2, axis2=-1), 1e-12)).reshape(len(covs), -1)
+
     def fit(self, covs, y):
-        x = np.log(np.maximum(np.diagonal(covs[:, 1:], axis1=-2, axis2=-1), 1e-12)).reshape(len(covs), -1)
+        x = self._features(covs)
         self.scaler = StandardScaler().fit(x)
         self.clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=0.5).fit(self.scaler.transform(x), y)
         return self
 
     def predict_proba(self, covs):
-        x = np.log(np.maximum(np.diagonal(covs[:, 1:], axis1=-2, axis2=-1), 1e-12)).reshape(len(covs), -1)
+        x = self._features(covs)
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class FBCSPLDAModel:
     def __init__(self, k=8, reg=0.1):
@@ -96,24 +107,30 @@ class FBCSPLDAModel:
     def fit(self, covs, y):
         self.filters_ = []
         c_dim = covs.shape[-1]
+        eye_ch = np.eye(c_dim, dtype=float)
         for band in range(1, len(ALL_MI_BANDS)):
             z = normtrace(covs[:, band])
             sub_filters = []
             for label in range(4):
-                a = shrink(z[y == label].mean(0), self.reg)
-                b = shrink(z[y != label].mean(0), self.reg)
+                m_pos = (y == label)
+                m_neg = ~m_pos
+                if not np.any(m_pos) or not np.any(m_neg):
+                    sub_filters.extend([eye_ch[0], eye_ch[-1]])
+                    continue
+                a = shrink(z[m_pos].mean(0), self.reg) + 1e-6 * eye_ch
+                b = shrink(z[m_neg].mean(0), self.reg) + 1e-6 * eye_ch
                 _, w = linalg.eigh(a, a + b)
                 sub_filters.extend([w[:, 0], w[:, -1]])
             self.filters_.append(np.array(sub_filters))
 
-        x = self._features(covs)
+        x = self._raw_features(covs)
         self.sel = SelectKBest(f_classif, k=min(self.k, x.shape[1])).fit(x, y)
         x_sel = self.sel.transform(x)
         self.scaler = StandardScaler().fit(x_sel)
         self.clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=0.5).fit(self.scaler.transform(x_sel), y)
         return self
 
-    def _features(self, covs):
+    def _raw_features(self, covs):
         feats = []
         for band in range(1, len(ALL_MI_BANDS)):
             w = self.filters_[band - 1]
@@ -122,21 +139,34 @@ class FBCSPLDAModel:
             feats.append(f)
         return np.concatenate(feats, axis=1)
 
+    def _features(self, covs):
+        return self._raw_features(covs)
+
     def predict_proba(self, covs):
-        x_sel = self.sel.transform(self._features(covs))
+        x_sel = self.sel.transform(self._raw_features(covs))
         p = self.clf.predict_proba(self.scaler.transform(x_sel))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class RCSPModel:
     def fit(self, covs, y):
         c_broad = normtrace(covs[:, 0])
         c_dim = covs.shape[-1]
+        eye_ch = np.eye(c_dim, dtype=float)
         filters = []
         for lab in range(4):
-            a = shrink(c_broad[y == lab].mean(0), 0.1)
-            b = shrink(c_broad[y != lab].mean(0), 0.1)
+            m_pos = (y == lab)
+            m_neg = ~m_pos
+            if not np.any(m_pos) or not np.any(m_neg):
+                if c_dim >= 6:
+                    filters.extend([eye_ch[0], eye_ch[min(1, c_dim - 1)], eye_ch[max(c_dim - 2, 0)], eye_ch[-1]])
+                else:
+                    filters.extend([eye_ch[0], eye_ch[-1]])
+                continue
+            a = shrink(c_broad[m_pos].mean(0), 0.1) + 1e-6 * eye_ch
+            b = shrink(c_broad[m_neg].mean(0), 0.1) + 1e-6 * eye_ch
             _, w = linalg.eigh(a, a + b)
-            if c_dim >= 4:
+            if c_dim >= 6:
                 filters.extend([w[:, 0], w[:, 1], w[:, -2], w[:, -1]])
             else:
                 filters.extend([w[:, 0], w[:, -1]])
@@ -150,20 +180,23 @@ class RCSPModel:
         c_broad = normtrace(covs[:, 0])
         x = np.log(np.maximum(np.einsum('kc,ncd,kd->nk', self.w, c_broad, self.w), 1e-12))
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class TangentLogRegModel:
     def fit(self, covs, y):
+        c_broad = shrink(normtrace(covs[:, 0]), 0.1) + 1e-6 * np.eye(covs.shape[-1])
         self.ts = TangentSpace(metric='riemann', tsupdate=False)
-        x = self.ts.fit_transform(shrink(covs[:, 0], 0.1))
+        x = self.ts.fit_transform(c_broad)
         self.scaler = StandardScaler().fit(x)
-        self.clf = LogisticRegression(C=0.1, max_iter=200).fit(self.scaler.transform(x), y)
+        self.clf = LogisticRegression(C=0.1, max_iter=2000).fit(self.scaler.transform(x), y)
         return self
 
     def predict_proba(self, covs):
-        x = self.ts.transform(shrink(covs[:, 0], 0.1))
+        c_broad = shrink(normtrace(covs[:, 0]), 0.1) + 1e-6 * np.eye(covs.shape[-1])
+        x = self.ts.transform(c_broad)
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
 
 MI_CANDIDATES = {
     'fbpower_lda': FBPowerLDAModel,
@@ -186,9 +219,9 @@ def fit_evidence(ps, pm, y_t):
 def predict_evidence(ps, pm, coef):
     return softmax(coef[0]*logp(ps) + coef[1]*logp(pm) + coef[2:])
 
-def _calibrate_ssvep_fold(raw_ss_fbcca, y, tr, te):
-    ts_fb = fit_temperature(raw_ss_fbcca[tr], y[tr], (0.005, 2.0))
-    return ts_fb, softmax(raw_ss_fbcca[tr] / ts_fb), softmax(raw_ss_fbcca[te] / ts_fb)
+def _calibrate_ssvep_fold(raw_ss_fbcca, y, train_blocks, tr, te):
+    ps_tr, ts_fb = fit_oof_temperature(raw_ss_fbcca[tr], y[tr], train_blocks, bounds=(0.005, 2.0))
+    return ts_fb, ps_tr, softmax(raw_ss_fbcca[te] / ts_fb)
 
 
 def _calibrate_reduced_mi_fold(covs, y, blocks, tr, te):
@@ -203,8 +236,7 @@ def _calibrate_reduced_mi_fold(covs, y, blocks, tr, te):
             sub_m = m_cls().fit(covs[tr[in_tr]], y_tr[in_tr])
             oof_m[in_val] = sub_m.predict_proba(covs[tr[in_val]])
 
-        tm_m = fit_temperature(logp(oof_m), y_tr, (0.25, 8.0))
-        pm_tr_m = softmax(logp(oof_m) / tm_m)
+        pm_tr_m, tm_m = fit_oof_temperature(logp(oof_m), y_tr, train_blocks, bounds=(0.25, 8.0))
         candidate_oof[m_key] = pm_tr_m
         candidate_temperatures[m_key] = tm_m
         candidate_scores[m_key] = float(np.mean(pm_tr_m.argmax(axis=1) == y_tr))
@@ -289,17 +321,22 @@ def _make_reduced_context(sub, meta, ch_name, test_b, extended_meta):
     return ctx
 
 
-def process_subject_spec(sub, spec, cache_path, diagnostics_dir=None, extended_meta=False):
-    data = np.load(cache_path, allow_pickle=True)
-    epochs = data['ds_epochs']
-    y = data['y']
+def process_subject_spec(sub, spec, cache_path, diagnostics_dir=None, extended_meta=False,
+                         filter_mode='epoch_zerophase', mi_reref='none', mi_decouple_ssvep=False):
+    required_channels = list(dict.fromkeys(OCC2 + ALL_MI_CHANNELS))
+    with np.load(cache_path, allow_pickle=True) as data:
+        parsed = validate_subject_cache(data, required_channels=required_channels, subject=sub)
+    epochs = parsed['epochs']
+    y = parsed['y']
     diagnostic = Diagnostics(diagnostics_dir) if diagnostics_dir is not None else None
-    trial_ids = data['trial_ids']
-    blocks = data['blocks']
-    ons = data['ons']
-    ch_labels = list(data['ch_labels'])
+    trial_ids = parsed['trial_ids']
+    blocks = parsed['blocks']
+    ons = parsed['ons']
+    ch_labels = parsed['ch_labels']
     n_trials = len(y)
     unique_blocks = np.unique(blocks)
+    if len(unique_blocks) < 2:
+        raise ValueError(f'Subject {sub} requires at least 2 blocks for LOBO cross-validation')
 
     ss_win = spec['ssvep_window']
     mi_win = spec['mi_window']
@@ -307,13 +344,14 @@ def process_subject_spec(sub, spec, cache_path, diagnostics_dir=None, extended_m
         epochs, ons, ch_labels, OCC2, ALL_MI_CHANNELS,
         ss_win, mi_win, ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
         NOMINAL_FREQUENCIES, FS, HARMONICS, extract_cca=False,
+        filter_mode=filter_mode, mi_reref='none', mi_decouple_ssvep=mi_decouple_ssvep,
     )
 
     ssvep_folds = {}
     for test_b in unique_blocks:
         te = np.where(blocks == test_b)[0]
         tr = np.where(blocks != test_b)[0]
-        ssvep_folds[test_b] = _calibrate_ssvep_fold(raw_ss_fbcca, y, tr, te)
+        ssvep_folds[test_b] = _calibrate_ssvep_fold(raw_ss_fbcca, y, blocks[tr], tr, te)
 
     meta = {
         'window_mode': spec['mode'],
@@ -330,6 +368,8 @@ def process_subject_spec(sub, spec, cache_path, diagnostics_dir=None, extended_m
     for ch_name, ch_list in MI_CHANNEL_CONFIGS.items():
         sub_idx = [ALL_MI_CHANNELS.index(c) for c in ch_list]
         covs = covs_all[:, :, sub_idx, :][:, :, :, sub_idx]
+        if mi_reref == 'subset_car':
+            covs = apply_cov_car(covs)
         pred_buf = _init_reduced_preds(n_trials)
 
         for test_b in unique_blocks:
@@ -350,17 +390,22 @@ def process_subject_spec(sub, spec, cache_path, diagnostics_dir=None, extended_m
     return records
 
 
-def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, extended_meta=True):
-    data = np.load(cache_path, allow_pickle=True)
-    epochs = data['ds_epochs']
-    y = data['y']
+def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, extended_meta=True,
+                              filter_mode='epoch_zerophase', mi_reref='none', mi_decouple_ssvep=False):
+    required_channels = list(dict.fromkeys(OCC2 + ALL_MI_CHANNELS))
+    with np.load(cache_path, allow_pickle=True) as data:
+        parsed = validate_subject_cache(data, required_channels=required_channels, subject=sub)
+    epochs = parsed['epochs']
+    y = parsed['y']
     diagnostic = Diagnostics(diagnostics_dir) if diagnostics_dir is not None else None
-    trial_ids = data['trial_ids']
-    blocks = data['blocks']
-    ons = data['ons']
-    ch_labels = list(data['ch_labels'])
+    trial_ids = parsed['trial_ids']
+    blocks = parsed['blocks']
+    ons = parsed['ons']
+    ch_labels = parsed['ch_labels']
     n_trials = len(y)
     unique_blocks = np.unique(blocks)
+    if len(unique_blocks) < 2:
+        raise ValueError(f'Subject {sub} requires at least 2 blocks for LOBO cross-validation')
 
     specs = w_conf['specs']
     n_segs = len(specs)
@@ -372,6 +417,7 @@ def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, ext
             epochs, ons, ch_labels, OCC2, ALL_MI_CHANNELS,
             sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
             NOMINAL_FREQUENCIES, FS, HARMONICS, segment_index=sp['segment_index'], extract_cca=False,
+            filter_mode=filter_mode, mi_reref='none', mi_decouple_ssvep=mi_decouple_ssvep,
         )
         for sp in specs
     ]
@@ -384,14 +430,16 @@ def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, ext
         tr_ps_list, te_ps_list = [], []
         for k in range(n_segs):
             _, raw_fb_k, _ = seg_features[k]
-            ts_k, ps_tr_k, ps_te_k = _calibrate_ssvep_fold(raw_fb_k, y, tr, te)
+            ts_k, ps_tr_k, ps_te_k = _calibrate_ssvep_fold(raw_fb_k, y, blocks[tr], tr, te)
             ssvep_step[test_b].append((ts_k, ps_tr_k, ps_te_k))
             tr_ps_list.append(ps_tr_k)
             te_ps_list.append(ps_te_k)
             if k == 0:
                 ssvep_accum[test_b].append((ts_k, ps_tr_k, ps_te_k))
             else:
-                ps_acc_tr, ps_acc_te, ts_acc = accumulate_log_probs(tr_ps_list, te_ps_list, y[tr])
+                ps_acc_tr, ps_acc_te, ts_acc = accumulate_log_probs(
+                    tr_ps_list, te_ps_list, y[tr], train_blocks=blocks[tr],
+                )
                 ssvep_accum[test_b].append((ts_acc, ps_acc_tr, ps_acc_te))
 
     step_metas = [
@@ -437,6 +485,8 @@ def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, ext
             for k in range(n_segs):
                 covs_all_k = seg_features[k][0]
                 covs_k = covs_all_k[:, :, sub_idx, :][:, :, :, sub_idx]
+                if mi_reref == 'subset_car':
+                    covs_k = apply_cov_car(covs_k)
                 cand_oof_k, cand_test_k, cand_scores_k, cand_temps_k = _calibrate_reduced_mi_fold(
                     covs_k, y, blocks, tr, te,
                 )
@@ -458,7 +508,7 @@ def process_subject_segmented(sub, w_conf, cache_path, diagnostics_dir=None, ext
                     acc_oof, acc_test, acc_scores, acc_temps = {}, {}, {}, {}
                     for m_key in MI_CANDIDATES:
                         pm_acc_tr, pm_acc_te, tm_acc = accumulate_log_probs(
-                            mi_oof_lists[m_key], mi_test_lists[m_key], y_tr,
+                            mi_oof_lists[m_key], mi_test_lists[m_key], y_tr, train_blocks=blocks[tr],
                         )
                         acc_oof[m_key] = pm_acc_tr
                         acc_test[m_key] = pm_acc_te
@@ -502,6 +552,9 @@ def main():
     cache_dir, out_dir = args.cache_dir, args.out_dir
     subjects = args.subjects
     cache_paths = {sub: cache_dir / f'{sub}_preprocessed.npz' for sub in subjects}
+    filter_mode = getattr(args, 'filter_mode', 'epoch_zerophase')
+    mi_reref = getattr(args, 'mi_reref', 'none')
+    mi_decouple_ssvep = bool(getattr(args, 'mi_decouple_ssvep', False))
 
     window_configs = windows(args)
     extended_meta = any(wc['mode'] != 'sync' for wc in window_configs)
@@ -513,6 +566,7 @@ def main():
                 diag_dir = out_dir / 'diagnostics' / f"{sub}_{w['name']}"
                 jobs.append(delayed(process_subject_segmented)(
                     sub, w, cache_paths[sub], diag_dir, extended_meta,
+                    filter_mode, mi_reref, mi_decouple_ssvep,
                 ))
         else:
             for sp in w['specs']:
@@ -524,6 +578,7 @@ def main():
                     diag_dir = out_dir / 'diagnostics' / tag
                     jobs.append(delayed(process_subject_spec)(
                         sub, sp, cache_paths[sub], diag_dir, extended_meta,
+                        filter_mode, mi_reref, mi_decouple_ssvep,
                     ))
 
     print(f"Launching {len(jobs)} tasks on {args.n_jobs} parallel CPU workers...")

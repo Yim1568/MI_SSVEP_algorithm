@@ -7,7 +7,7 @@ complementarity ('fusion_logloss') or standalone MI Log-Loss ('mi_logloss').
 import numpy as np
 from scipy import linalg
 
-from windowing import logp, softmax
+from windowing import align_proba_4class, apply_cov_car, logp, softmax
 
 CENTRAL_18 = [
     'C3', 'C4', 'FC3', 'FC4', 'CP3', 'CP4', 'C1', 'C2', 'C5', 'C6',
@@ -39,16 +39,6 @@ def _shrink(c, amount=0.1):
 def _normtrace(c):
     tr = np.trace(c, axis1=-2, axis2=-1)[..., None, None]
     return c / np.maximum(tr, 1e-12)
-
-
-def _align_proba_4class(proba, classes, n_classes=4):
-    if len(classes) == n_classes and np.array_equal(classes, np.arange(n_classes)):
-        return proba
-    out = np.full((len(proba), n_classes), 1e-6, dtype=float)
-    for col, cls in enumerate(classes):
-        out[:, int(cls)] = proba[:, col]
-    out /= out.sum(axis=1, keepdims=True)
-    return out
 
 
 def _cross_entropy(probs, y):
@@ -92,7 +82,7 @@ def _fit_predict_scaled_lda(x_tr, y_tr, x_val, shrinkage=0.5, n_classes=4):
     coef = np.linalg.solve(cov_shrunk, means.T).T
     intercept = -0.5 * np.sum(means * coef, axis=1) + np.log(priors)
     proba = softmax(xn_val @ coef.T + intercept)
-    return _align_proba_4class(proba, present, n_classes=n_classes)
+    return align_proba_4class(proba, present, n_classes=n_classes)
 
 
 def _anova_f_scores(x, y, n_classes=4):
@@ -135,13 +125,27 @@ def _fit_temperature_fast(z, y, bounds=(0.25, 8.0)):
     return 1.0 / beta
 
 
+def _fit_oof_temperature_fast(z, y, splits, bounds=(0.25, 8.0)):
+    if len(splits) < 5:
+        tm = _fit_temperature_fast(z, y, bounds=bounds)
+        return softmax(z / tm)
+    out = np.zeros_like(z)
+    for in_tr, in_val in splits:
+        if len(in_tr) < 4 or len(np.unique(y[in_tr])) < 2:
+            tm = _fit_temperature_fast(z, y, bounds=bounds)
+        else:
+            tm = _fit_temperature_fast(z[in_tr], y[in_tr], bounds=bounds)
+        out[in_val] = softmax(z[in_val] / tm)
+    return out
+
+
 def _fast_fbpower_oof(diag_log_sub, y_tr, train_blocks, splits=None):
+    splits = splits if splits is not None else list(_iter_inner_splits(train_blocks))
     x = diag_log_sub.reshape(len(y_tr), -1)
     oof = np.full((len(y_tr), 4), 0.25, dtype=float)
-    for in_tr, in_val in (splits if splits is not None else _iter_inner_splits(train_blocks)):
+    for in_tr, in_val in splits:
         oof[in_val] = _fit_predict_scaled_lda(x[in_tr], y_tr[in_tr], x[in_val])
-    tm = _fit_temperature_fast(logp(oof), y_tr, bounds=(0.25, 8.0))
-    return softmax(logp(oof) / tm)
+    return _fit_oof_temperature_fast(logp(oof), y_tr, splits, bounds=(0.25, 8.0))
 
 
 def _fast_fbcsp_oof(covs_sub, y_tr, train_blocks, k_feat=8, reg=0.1, splits=None):
@@ -206,8 +210,8 @@ def _fast_fbcsp_oof(covs_sub, y_tr, train_blocks, k_feat=8, reg=0.1, splits=None
             x_tr[:, top_idx], y_tr[in_tr], x_all[in_val][:, top_idx], n_classes=n_classes,
         )
 
-    tm = _fit_temperature_fast(logp(oof), y_tr, bounds=(0.25, 8.0))
-    return softmax(logp(oof) / tm)
+    splits_inner = splits if splits is not None else list(_iter_inner_splits(train_blocks))
+    return _fit_oof_temperature_fast(logp(oof), y_tr, splits_inner, bounds=(0.25, 8.0))
 
 
 def _fit_anchored_b_newton(ls_in, lm_in, y_in, reg=0.05, b_max=3.0):
@@ -247,11 +251,16 @@ def _anchored_fusion_oof_logloss(ps_tr, pm_tr, y_tr, train_blocks, reg=0.05, spl
     return _cross_entropy(p_oof, y_tr)
 
 
-def _eval_subset_objective(idx, covs_tr, diag_log_all, y_tr, train_blocks, ps_tr,
-                           objective, k_min, n_pool, card_penalty=0.002, splits=None):
+def _eval_subset_objective(idx, covs_tr, y_tr, train_blocks, ps_tr,
+                           objective, k_min, n_pool, card_penalty=0.002, splits=None,
+                           mi_reref='none'):
     idx_arr = np.asarray(idx, dtype=int)
     covs_sub = covs_tr[:, :, idx_arr, :][:, :, :, idx_arr]
-    diag_sub = diag_log_all[:, :, idx_arr]
+    if mi_reref == 'subset_car':
+        covs_sub = apply_cov_car(covs_sub)
+
+    covs_sub_norm = _normtrace(covs_sub[:, 1:])
+    diag_sub = np.log(np.maximum(np.diagonal(covs_sub_norm, axis1=-2, axis2=-1), 1e-12))
 
     pm_power = _fast_fbpower_oof(diag_sub, y_tr, train_blocks, splits=splits)
     nll_power = _cross_entropy(pm_power, y_tr)
@@ -274,8 +283,10 @@ def _eval_subset_objective(idx, covs_tr, diag_log_all, y_tr, train_blocks, ps_tr
     return float(base_loss + penalty)
 
 
-def _channel_importance_scores(covs_sub, y_sub, reg=0.1):
-    """Combine multi-band CSP forward spatial pattern energy and log-power F-scores."""
+def _channel_importance_scores(covs_sub, y_sub, reg=0.1, mi_reref='none'):
+    """Combine multi-band CSP forward spatial pattern energy and trace-normalized log-power F-scores."""
+    if mi_reref == 'subset_car':
+        covs_sub = apply_cov_car(covs_sub)
     n_ch = covs_sub.shape[-1]
     csp_energy = np.zeros(n_ch, dtype=float)
     f_energy = np.zeros(n_ch, dtype=float)
@@ -314,7 +325,7 @@ def _channel_importance_scores(covs_sub, y_sub, reg=0.1):
     return 0.5 * csp_energy + 0.5 * f_energy
 
 
-def _select_stability_rfe(eval_fn, covs_tr, y_tr, train_blocks, k_min, k_max):
+def _select_stability_rfe(eval_fn, covs_tr, y_tr, train_blocks, k_min, k_max, mi_reref='none'):
     n_pool = covs_tr.shape[-1]
     fold_ranks = np.zeros(n_pool, dtype=float)
     splits = list(_iter_inner_splits(train_blocks))
@@ -326,7 +337,7 @@ def _select_stability_rfe(eval_fn, covs_tr, y_tr, train_blocks, k_min, k_max):
 
         while len(active) > 2:
             covs_act = covs_tr[np.ix_(in_tr, range(covs_tr.shape[1]), active, active)]
-            scores = _channel_importance_scores(covs_act, y_tr[in_tr])
+            scores = _channel_importance_scores(covs_act, y_tr[in_tr], mi_reref=mi_reref)
             worst_pos = int(np.argmin(scores))
             elim_ch = active.pop(worst_pos)
             ranks[elim_ch] = float(rank_cursor)
@@ -484,7 +495,8 @@ def _select_pso(eval_fn, n_pool, k_min, k_max, seed=42, n_particles=24, n_iter=2
 
 def select_channels(covs_tr, y_tr, train_blocks, channel_names, ps_tr=None,
                     method='rfe', k_min=8, k_max=12, objective='fusion_logloss',
-                    seed=42, ga_pop=24, ga_gen=20, pso_particles=24, pso_iter=20):
+                    seed=42, ga_pop=24, ga_gen=20, pso_particles=24, pso_iter=20,
+                    mi_reref='none'):
     """Select personalized MI channel subset [k_min, k_max] inside one training fold."""
     n_pool = len(channel_names)
     if covs_tr.shape[-1] != n_pool:
@@ -504,7 +516,6 @@ def select_channels(covs_tr, y_tr, train_blocks, channel_names, ps_tr=None,
     if not (2 <= k_min <= k_max <= n_pool):
         raise ValueError(f'Invalid cardinality bounds [{k_min}, {k_max}] for pool size {n_pool}')
 
-    diag_log_all = np.log(np.maximum(np.diagonal(covs_tr[:, 1:], axis1=-2, axis2=-1), 1e-12))
     splits = list(_iter_inner_splits(train_blocks))
     eval_cache = {}
 
@@ -512,19 +523,23 @@ def select_channels(covs_tr, y_tr, train_blocks, channel_names, ps_tr=None,
         key = tuple(sorted(int(i) for i in cand))
         if key not in eval_cache:
             eval_cache[key] = _eval_subset_objective(
-                key, covs_tr, diag_log_all, y_tr, train_blocks, ps_tr,
+                key, covs_tr, y_tr, train_blocks, ps_tr,
                 objective=objective, k_min=k_min, n_pool=n_pool, splits=splits,
+                mi_reref=mi_reref,
             )
         return eval_cache[key]
 
     full_idx = list(range(n_pool))
     full_score = _eval_subset_objective(
-        full_idx, covs_tr, diag_log_all, y_tr, train_blocks, ps_tr,
+        full_idx, covs_tr, y_tr, train_blocks, ps_tr,
         objective=objective, k_min=k_min, n_pool=n_pool, card_penalty=0.0, splits=splits,
+        mi_reref=mi_reref,
     )
 
     if method == 'rfe':
-        best_idx, best_score = _select_stability_rfe(_cached_eval, covs_tr, y_tr, train_blocks, k_min, k_max)
+        best_idx, best_score = _select_stability_rfe(
+            _cached_eval, covs_tr, y_tr, train_blocks, k_min, k_max, mi_reref=mi_reref,
+        )
     elif method == 'ga':
         best_idx, best_score = _select_ga(
             _cached_eval, n_pool, k_min, k_max, seed=seed, pop_size=ga_pop, n_gen=ga_gen,

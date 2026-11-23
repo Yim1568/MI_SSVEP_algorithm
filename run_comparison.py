@@ -12,15 +12,18 @@ Constraints strictly followed:
 from runtime import arguments, windows
 from windowing import (
     accumulate_log_probs,
+    align_proba_4class,
     cca_scores,
     covariance,
     extract_dual_features,
+    fit_oof_temperature,
     fit_temperature,
     format_window_span,
     logp,
     reference,
     resolve_window_configs,
     softmax,
+    validate_subject_cache,
 )
 import time
 from pathlib import Path
@@ -34,14 +37,14 @@ from sklearn.feature_selection import SelectKBest, f_classif
 
 # Configuration & Constants
 FS = 250
-HARMONICS = 3
+HARMONICS = 4
 NOMINAL_FREQUENCIES = [12.0, 10.0, 60.0 / 7.0, 7.5]  # thumb, index, middle, little
 CLASS_NAMES = ['thumb', 'index', 'middle', 'little']
 
 CENTRAL = ['C3', 'C4', 'FC3', 'FC4', 'CP3', 'CP4', 'C1', 'C2', 'C5', 'C6',
            'FC1', 'FC2', 'FC5', 'FC6', 'CP1', 'CP2', 'CP5', 'CP6']
 
-FBCCA_BANDS = [(6, 45), (10, 45), (14, 45), (18, 45), (22, 45)]
+FBCCA_BANDS = [(6, 45), (9, 45), (14, 45), (18, 45), (21, 45)]
 FB_WEIGHTS = np.arange(1, len(FBCCA_BANDS) + 1)**(-1.25) + 0.25
 
 MI_BROAD_BAND = (8, 30)
@@ -50,13 +53,14 @@ ALL_MI_BANDS = [MI_BROAD_BAND] + MI_SUB_BANDS
 
 
 def shrink(c, amount=0.1):
-    c = np.asarray(c)
+    c = np.asarray(c, dtype=float)
     n = c.shape[-1]
-    return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / n
+    return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / max(n, 1)
 
 
 def normtrace(c):
     return c / np.maximum(np.trace(c, axis1=-2, axis2=-1)[..., None, None], 1e-12)
+
 
 # Models
 class FBCSPLDAModel:
@@ -66,24 +70,31 @@ class FBCSPLDAModel:
 
     def fit(self, covs, y):
         self.filters_ = []
+        c_dim = covs.shape[-1]
+        eye_ch = np.eye(c_dim, dtype=float)
         for band in range(1, len(ALL_MI_BANDS)):
             z = normtrace(covs[:, band])
             sub_filters = []
             for label in range(4):
-                a = shrink(z[y == label].mean(0), self.reg)
-                b = shrink(z[y != label].mean(0), self.reg)
+                m_pos = (y == label)
+                m_neg = ~m_pos
+                if not np.any(m_pos) or not np.any(m_neg):
+                    sub_filters.extend([eye_ch[0], eye_ch[-1]])
+                    continue
+                a = shrink(z[m_pos].mean(0), self.reg) + 1e-6 * eye_ch
+                b = shrink(z[m_neg].mean(0), self.reg) + 1e-6 * eye_ch
                 _, w = linalg.eigh(a, a + b)
                 sub_filters.extend([w[:, 0], w[:, -1]])
             self.filters_.append(np.array(sub_filters))
 
-        x = self._features(covs)
+        x = self._raw_features(covs)
         self.sel = SelectKBest(f_classif, k=min(self.k, x.shape[1])).fit(x, y)
         x_sel = self.sel.transform(x)
         self.scaler = StandardScaler().fit(x_sel)
         self.clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=0.5).fit(self.scaler.transform(x_sel), y)
         return self
 
-    def _features(self, covs):
+    def _raw_features(self, covs):
         feats = []
         for band in range(1, len(ALL_MI_BANDS)):
             w = self.filters_[band - 1]
@@ -92,14 +103,16 @@ class FBCSPLDAModel:
             feats.append(f)
         return np.concatenate(feats, axis=1)
 
+    def _features(self, covs):
+        return self._raw_features(covs)
+
     def transform(self, covs):
-        return self.sel.transform(self._features(covs))
+        return self.sel.transform(self._raw_features(covs))
 
     def predict_proba(self, covs):
         x = self.scaler.transform(self.transform(covs))
-        classes = self.clf.classes_
         p = self.clf.predict_proba(x)
-        return p[:, np.argsort(classes)]
+        return align_proba_4class(p, self.clf.classes_)
 
 class FixedFusion:
     def __init__(self, weight=0.5):
@@ -204,7 +217,8 @@ class StackFusion:
     def predict_proba(self, ps, pm):
         x = np.column_stack([logp(ps), logp(pm)])
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class FeatureFusionModel:
     def __init__(self, k=8, C=0.1):
@@ -212,16 +226,19 @@ class FeatureFusionModel:
         self.C = C
 
     def fit(self, mi_feats, ss_scores, y):
-        self.mi_scaler = StandardScaler().fit(mi_feats)
+        self.mi_sel = SelectKBest(f_classif, k=min(self.k, mi_feats.shape[1])).fit(mi_feats, y)
+        mi_sel_tr = self.mi_sel.transform(mi_feats)
+        self.mi_scaler = StandardScaler().fit(mi_sel_tr)
         self.ss_scaler = StandardScaler().fit(ss_scores)
-        x = np.column_stack([self.mi_scaler.transform(mi_feats), self.ss_scaler.transform(ss_scores)])
+        x = np.column_stack([self.mi_scaler.transform(mi_sel_tr), self.ss_scaler.transform(ss_scores)])
         self.clf = LogisticRegression(C=self.C, max_iter=2000).fit(x, y)
         return self
 
     def predict_proba(self, mi_feats, ss_scores):
-        x = np.column_stack([self.mi_scaler.transform(mi_feats), self.ss_scaler.transform(ss_scores)])
+        mi_sel_te = self.mi_sel.transform(mi_feats)
+        x = np.column_stack([self.mi_scaler.transform(mi_sel_te), self.ss_scaler.transform(ss_scores)])
         p = self.clf.predict_proba(x)
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
 
 class SelectiveCorrection:
     @staticmethod
@@ -283,30 +300,36 @@ def _init_comparison_preds(n_trials):
 def _calibrate_comparison_fold(covs, raw_ss_cca, raw_ss_fbcca, y, blocks, train_idx, test_idx):
     mi_model = FBCSPLDAModel(k=8, reg=0.1).fit(covs[train_idx], y[train_idx])
     test_mi_p = mi_model.predict_proba(covs[test_idx])
+    test_mi_full_feats = mi_model._raw_features(covs[test_idx])
 
     oof_mi_p = np.zeros((len(train_idx), 4))
+    oof_mi_full_feats = None
     train_blocks = blocks[train_idx]
     for inner_b in np.unique(train_blocks):
         inner_val_sub = np.where(train_blocks == inner_b)[0]
         inner_tr_sub = np.where(train_blocks != inner_b)[0]
         sub_mi_model = FBCSPLDAModel(k=8, reg=0.1).fit(covs[train_idx[inner_tr_sub]], y[train_idx[inner_tr_sub]])
         oof_mi_p[inner_val_sub] = sub_mi_model.predict_proba(covs[train_idx[inner_val_sub]])
+        sub_feats = sub_mi_model._raw_features(covs[train_idx[inner_val_sub]])
+        if oof_mi_full_feats is None:
+            oof_mi_full_feats = np.zeros((len(train_idx), sub_feats.shape[1]), dtype=float)
+        oof_mi_full_feats[inner_val_sub] = sub_feats
 
-    tm = fit_temperature(logp(oof_mi_p), y[train_idx], bounds=(0.25, 8.0))
-    ts_cca = fit_temperature(raw_ss_cca[train_idx], y[train_idx], bounds=(0.005, 2.0))
-    ts_fbcca = fit_temperature(raw_ss_fbcca[train_idx], y[train_idx], bounds=(0.005, 2.0))
+    pm_tr, tm = fit_oof_temperature(logp(oof_mi_p), y[train_idx], train_blocks, bounds=(0.25, 8.0))
+    ps_cca_tr, ts_cca = fit_oof_temperature(raw_ss_cca[train_idx], y[train_idx], train_blocks, bounds=(0.005, 2.0))
+    ps_fbcca_tr, ts_fbcca = fit_oof_temperature(raw_ss_fbcca[train_idx], y[train_idx], train_blocks, bounds=(0.005, 2.0))
 
     s_sort_tr = np.sort(raw_ss_fbcca[train_idx], axis=1)
     s_sort_te = np.sort(raw_ss_fbcca[test_idx], axis=1)
     return {
-        'pm_tr': softmax(logp(oof_mi_p) / tm),
+        'pm_tr': pm_tr,
         'pm_te': softmax(logp(test_mi_p) / tm),
-        'ps_cca_tr': softmax(raw_ss_cca[train_idx] / ts_cca),
+        'ps_cca_tr': ps_cca_tr,
         'ps_cca_te': softmax(raw_ss_cca[test_idx] / ts_cca),
-        'ps_fbcca_tr': softmax(raw_ss_fbcca[train_idx] / ts_fbcca),
+        'ps_fbcca_tr': ps_fbcca_tr,
         'ps_fbcca_te': softmax(raw_ss_fbcca[test_idx] / ts_fbcca),
-        'mi_feats_tr': mi_model.transform(covs[train_idx]),
-        'mi_feats_te': mi_model.transform(covs[test_idx]),
+        'mi_feats_tr': oof_mi_full_feats,
+        'mi_feats_te': test_mi_full_feats,
         'ss_raw_tr': raw_ss_fbcca[train_idx],
         'ss_raw_te': raw_ss_fbcca[test_idx],
         'margin_tr': s_sort_tr[:, -1] - s_sort_tr[:, -2],
@@ -314,15 +337,21 @@ def _calibrate_comparison_fold(covs, raw_ss_cca, raw_ss_fbcca, y, blocks, train_
     }
 
 
-def _accumulate_comparison_fold(seg_folds_prefix, y_tr):
+def _accumulate_comparison_fold(seg_folds_prefix, y_tr, train_blocks=None):
     if len(seg_folds_prefix) == 1:
         return seg_folds_prefix[0]
     pm_tr, pm_te, _ = accumulate_log_probs(
-        [f['pm_tr'] for f in seg_folds_prefix], [f['pm_te'] for f in seg_folds_prefix], y_tr)
+        [f['pm_tr'] for f in seg_folds_prefix], [f['pm_te'] for f in seg_folds_prefix],
+        y_tr, train_blocks=train_blocks,
+    )
     ps_cca_tr, ps_cca_te, _ = accumulate_log_probs(
-        [f['ps_cca_tr'] for f in seg_folds_prefix], [f['ps_cca_te'] for f in seg_folds_prefix], y_tr)
+        [f['ps_cca_tr'] for f in seg_folds_prefix], [f['ps_cca_te'] for f in seg_folds_prefix],
+        y_tr, train_blocks=train_blocks,
+    )
     ps_fbcca_tr, ps_fbcca_te, _ = accumulate_log_probs(
-        [f['ps_fbcca_tr'] for f in seg_folds_prefix], [f['ps_fbcca_te'] for f in seg_folds_prefix], y_tr)
+        [f['ps_fbcca_tr'] for f in seg_folds_prefix], [f['ps_fbcca_te'] for f in seg_folds_prefix],
+        y_tr, train_blocks=train_blocks,
+    )
 
     ss_raw_tr = np.mean([f['ss_raw_tr'] for f in seg_folds_prefix], axis=0)
     ss_raw_te = np.mean([f['ss_raw_te'] for f in seg_folds_prefix], axis=0)
@@ -412,25 +441,23 @@ def _record_comparison_outputs(fold_preds, l_key, occ_leads, meta, sub, y, block
             trial_predictions.append(pred_row)
 
 
-def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
+def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None,
+                   filter_mode='epoch_zerophase', mi_reref='none', mi_decouple_ssvep=False):
     cache_dir = Path(cache_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     subjects = subjects or ['YDL', 'YZL', 'FHY']
+    lead_configs = {'3leads': ['O1', 'Oz', 'O2'], '2leads': ['O1', 'O2']}
+    required_channels = list(dict.fromkeys(['O1', 'Oz', 'O2'] + CENTRAL))
     loaded_data = {}
     for sub in subjects:
-        data = np.load(cache_dir / f'{sub}_preprocessed.npz', allow_pickle=True)
-        loaded_data[sub] = {
-            'epochs': data['ds_epochs'],
-            'y': data['y'],
-            'blocks': data['blocks'],
-            'trial_ids': data['trial_ids'],
-            'ons': data['ons'],
-            'ch_labels': list(data['ch_labels']),
-        }
+        with np.load(cache_dir / f'{sub}_preprocessed.npz', allow_pickle=True) as data:
+            parsed = validate_subject_cache(data, required_channels=required_channels, subject=sub)
+        if len(np.unique(parsed['blocks'])) < 2:
+            raise ValueError(f'Subject {sub} requires at least 2 blocks for LOBO cross-validation')
+        loaded_data[sub] = parsed
 
-    lead_configs = {'3leads': ['O1', 'Oz', 'O2'], '2leads': ['O1', 'O2']}
     window_configs = window_configs or resolve_window_configs([0.0, 0.5], None, ('sync',))
     extended_meta = any(wc.get('mode', 'sync') != 'sync' for wc in window_configs)
 
@@ -500,6 +527,8 @@ def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
                             sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS,
                             FB_WEIGHTS, NOMINAL_FREQUENCIES, FS, HARMONICS,
                             segment_index=sp['segment_index'], extract_cca=True,
+                            filter_mode=filter_mode, mi_reref=mi_reref,
+                            mi_decouple_ssvep=mi_decouple_ssvep,
                         )
                         for sp in specs
                     ]
@@ -518,7 +547,7 @@ def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
                             )
                             fold_segs.append(fd_k)
                             _eval_comparison_fold(fd_k, y_tr, groups_tr, step_preds[k], test_idx)
-                            fd_acc = _accumulate_comparison_fold(fold_segs, y_tr)
+                            fd_acc = _accumulate_comparison_fold(fold_segs, y_tr, train_blocks=groups_tr)
                             _eval_comparison_fold(fd_acc, y_tr, groups_tr, accum_preds[k], test_idx)
 
                     for k in range(n_segs):
@@ -552,6 +581,8 @@ def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
                         s_data['epochs'], ons, s_data['ch_labels'], occ_leads, CENTRAL,
                         sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS,
                         FB_WEIGHTS, NOMINAL_FREQUENCIES, FS, HARMONICS, extract_cca=True,
+                        filter_mode=filter_mode, mi_reref=mi_reref,
+                        mi_decouple_ssvep=mi_decouple_ssvep,
                     )
                     fold_preds = _init_comparison_preds(len(y))
                     for test_b in np.unique(blocks):
@@ -598,4 +629,9 @@ def run_experiment(cache_dir, out_dir, subjects=None, window_configs=None):
 
 if __name__ == '__main__':
     args = arguments('comparison')
-    run_experiment(args.cache_dir, args.out_dir, args.subjects, args.resolved_windows)
+    run_experiment(
+        args.cache_dir, args.out_dir, args.subjects, args.resolved_windows,
+        filter_mode=args.filter_mode,
+        mi_reref=args.mi_reref,
+        mi_decouple_ssvep=args.mi_decouple_ssvep,
+    )

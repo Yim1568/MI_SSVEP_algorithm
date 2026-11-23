@@ -1,5 +1,21 @@
 # 变更记录
 
+## 0.6.0 — 2026-11-23
+
+- **脑电信号滤波、抗混叠瞬态与边界安全校验 (`windowing.py`, `runtime.py`)**:
+  - 新增 `--filter-mode {epoch_zerophase,causal,window_zerophase}`：默认改为 `epoch_zerophase`（先利用整段试次上下文做零相位 `sosfiltfilt`，再精确切窗，消除 0.5s 短窗和 `equal_segmented` 分段的边界振铃伪迹），同时支持严格单向无未来泄漏的 `causal`（`sosfilt`）在线仿真模式与历史复现 `window_zerophase` 模式。
+  - 为 `extract_dual_features` 中的宽带 `raw_ss_cca` 补充 `(6, 45) Hz` 带通滤波，抑制 `<6 Hz` 慢漂移与眼电干扰。
+  - 新增 `validate_subject_cache` 与切片样本数严格边界检查，校验必需键、试次对齐、`NaN/Inf`、标签值域 `{0, 1, 2, 3}`、必需导联与窗口越界，防止静默截断或负索引回绕。
+  - 新增 `--mi-reref {none,subset_car}`（仅在当前活跃 MI 导联子集内部做局部 CAR，支持信号域 `apply_subset_car` 与协方差域等价变换 `apply_cov_car`，严禁全脑 CAR 跨区耦合）与 `--mi-decouple-ssvep`（`project_out_ssvep` 锁相谐波正交投影剔除消融开关）。
+- **MI 特征迹归一化与小样本鲁棒性 (`channel_selection.py`, `run_adaptive_fusion.py`, `run_reduced_mi_leads.py`, `run_comparison.py`)**:
+  - 为 `FBPowerLDAModel`、`TangentLogRegModel` 与 `channel_selection.py` 的 `_eval_subset_objective` 统一引入子集内迹归一化 `c / trace(c)`（及 `1e-6 * I` 数值正定保护），消除跨 block 幅值/阻抗漂移并严防未选中通道通过 `trace(c)` 泄露；统一 `TangentLogRegModel` `max_iter=2000`。
+  - 修复 `RCSPModel` 在 `<= 4` 导联下提取冗余全特征向量问题（`<= 4` 导每类取首尾 2 极，`>= 6` 导取 4 极），并在全部分类器接入 `align_proba_4class` 与 CSP 缺类兜底。
+- **FBCCA 频带边界、融合归因对齐与防泄露评估 (`run_adaptive_fusion.py`, `run_comparison.py`, `run_reduced_mi_leads.py`)**:
+  - 调整 `FBCCA_BANDS` 为 `[(6, 45), (9, 45), (14, 45), (18, 45), (21, 45)]` 并设 `HARMONICS = 4`，避开 10 Hz 基频压线衰减并均衡各刺激频点的谐波覆盖。
+  - 对齐 `true_oof_fusion_gain` 参照基准（以实际输入融合的 `ps_tr_base` 为准且在内层同步应用 `margin >= 0.6` 门控），并在扩展模式与诊断表中记录 `ss_fbcca_cca_synergy`。
+  - 将 SSVEP、MI 与多段累加温度校准升级为嵌套内层 OOF 温度校准（`fit_oof_temperature`）；固定 `_precompute_subject_fold_channels` 参考窗提取，使其不再受 CLI `--durations` 组合或 `--starts` 传入顺序影响。
+  - 修复 `run_comparison.py` 中 `FeatureFusionModel` 折内有监督特征过拟合泄露及分段累积列错位问题：改用内层 LOBO OOF 提取的 48 维固定槽位特征跨段平均，再在折内拟合 `SelectKBest(k=8)` + 逻辑回归。
+
 ## 0.5.0 — 2026-11-22
 
 - **CENTRAL_21 感觉运动全网格与折内个性化通道筛选 (`channel_selection.py`)**:

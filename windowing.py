@@ -10,6 +10,8 @@ import numpy as np
 from scipy import linalg, optimize, signal, special
 
 VALID_WINDOW_MODES = ('sync', 'decoupled', 'equal_cumulative', 'equal_segmented', 'all_equal')
+VALID_FILTER_MODES = ('epoch_zerophase', 'causal', 'window_zerophase')
+VALID_MI_REREF_MODES = ('none', 'subset_car')
 DEFAULT_FS = 250
 
 
@@ -22,8 +24,137 @@ def logp(p):
 
 
 def covariance(x):
+    x = np.asarray(x, dtype=float)
     x = x - x.mean(0)
     return x.T @ x / max(len(x) - 1, 1)
+
+
+def align_proba_4class(proba, classes, n_classes=4):
+    """Map classifier probability columns onto canonical classes 0..n_classes-1."""
+    proba = np.asarray(proba, dtype=float)
+    classes = np.asarray(classes, dtype=int)
+    if len(classes) == n_classes and np.array_equal(classes, np.arange(n_classes)):
+        return proba
+    out = np.full((len(proba), n_classes), 1e-6, dtype=float)
+    for col, cls in enumerate(classes):
+        if 0 <= int(cls) < n_classes:
+            out[:, int(cls)] = proba[:, col]
+    out = np.maximum(out, 1e-12)
+    out /= out.sum(axis=1, keepdims=True)
+    return out
+
+
+def apply_subset_car(x):
+    """Apply Common Average Reference strictly within the provided channel subset."""
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 2 or x.shape[1] < 2:
+        return x
+    return x - x.mean(axis=1, keepdims=True)
+
+
+def apply_cov_car(covs):
+    """Apply subset Common Average Reference directly on covariance matrices (H C H)."""
+    covs = np.asarray(covs, dtype=float)
+    n_ch = covs.shape[-1]
+    if n_ch < 2:
+        return covs.copy()
+    h = np.eye(n_ch) - (1.0 / n_ch)
+    return h @ covs @ h
+
+
+def _ssvep_projection_basis(n_samp, freqs, fs=DEFAULT_FS, max_harmonics=5, max_freq=40.0):
+    t = np.arange(n_samp) / fs
+    nyq_limit = min(float(max_freq), fs / 2.0 - 1e-6)
+    ff = sorted({
+        round(float(f) * h, 8)
+        for f in freqs
+        for h in range(1, int(max_harmonics) + 1)
+        if 0.0 < float(f) * h <= nyq_limit
+    })
+    if not ff:
+        return np.empty((n_samp, 0), dtype=float)
+    ref = np.column_stack([fun(2 * np.pi * f * t) for f in ff for fun in (np.sin, np.cos)])
+    ref = ref - ref.mean(axis=0, keepdims=True)
+    u, s, _ = linalg.svd(ref, full_matrices=False)
+    return u[:, s > max(float(s.max(initial=0)) * 1e-8, 1e-12)]
+
+
+def project_out_ssvep(x, freqs, fs=DEFAULT_FS, max_harmonics=5, max_freq=40.0):
+    """Orthogonally project out phase-locked SSVEP harmonic components from a slice."""
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 2 or len(x) < 3 or x.shape[1] < 1:
+        return x
+    xc = x - x.mean(axis=0, keepdims=True)
+    u = _ssvep_projection_basis(len(x), freqs, fs=fs, max_harmonics=max_harmonics, max_freq=max_freq)
+    if u.shape[1] == 0:
+        return xc
+    return xc - u @ (u.T @ xc)
+
+
+def validate_subject_cache(data, required_channels=None, subject=None):
+    """Validate preprocessed cache keys, trial alignment, finite values, labels, and channels."""
+    tag = f'subject {subject}' if subject else 'cache'
+    required_keys = ('ds_epochs', 'y', 'blocks', 'trial_ids', 'ons', 'ch_labels')
+    missing_keys = [k for k in required_keys if k not in data]
+    if missing_keys:
+        raise ValueError(f'{tag}: missing required cache keys {missing_keys}')
+
+    epochs = data['ds_epochs']
+    y_raw = np.asarray(data['y'])
+    blocks = np.asarray(data['blocks'])
+    trial_ids = data['trial_ids']
+    ons_raw = np.asarray(data['ons'])
+    ch_labels = [str(c) for c in data['ch_labels']]
+
+    n_trials = len(y_raw)
+    if n_trials == 0:
+        raise ValueError(f'{tag}: cache contains zero trials')
+    if any(len(arr) != n_trials for arr in (epochs, blocks, trial_ids, ons_raw)):
+        raise ValueError(
+            f'{tag}: misaligned cache lengths ds_epochs={len(epochs)}, y={n_trials}, '
+            f'blocks={len(blocks)}, trial_ids={len(trial_ids)}, ons={len(ons_raw)}'
+        )
+
+    try:
+        ons = np.asarray(ons_raw, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{tag}: ons must be finite numeric sample indices') from exc
+    if not np.all(np.isfinite(ons)):
+        raise ValueError(f'{tag}: ons contains NaN or Inf')
+
+    try:
+        y_num = np.asarray(y_raw, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{tag}: y labels must be integers in {{0, 1, 2, 3}}') from exc
+    if not np.all(np.isfinite(y_num)):
+        raise ValueError(f'{tag}: y contains NaN or Inf')
+    y = y_num.astype(int)
+    if not np.array_equal(y_num, y) or not set(np.unique(y).tolist()).issubset({0, 1, 2, 3}):
+        raise ValueError(f'{tag}: y labels must be integers in {{0, 1, 2, 3}}, got {np.unique(y_raw).tolist()}')
+
+    n_ch = len(ch_labels)
+    if n_ch == 0:
+        raise ValueError(f'{tag}: ch_labels is empty')
+    if required_channels is not None:
+        missing_ch = [c for c in required_channels if c not in ch_labels]
+        if missing_ch:
+            raise ValueError(f'{tag}: missing required channels {missing_ch}')
+
+    for idx in range(n_trials):
+        ep = np.asarray(epochs[idx], dtype=float)
+        if ep.ndim != 2 or ep.shape[1] != n_ch:
+            raise ValueError(f'{tag}: trial {idx} expected shape (n_samples, {n_ch}), got {ep.shape}')
+        if not np.isfinite(ep).all():
+            raise ValueError(f'{tag}: trial {idx} contains NaN or Inf')
+
+    return {
+        'epochs': epochs,
+        'y': y,
+        'blocks': blocks,
+        'trial_ids': trial_ids,
+        'ons': ons,
+        'ch_labels': ch_labels,
+    }
 
 
 def fit_temperature(z, y, bounds=(0.005, 8.0)):
@@ -35,13 +166,34 @@ def fit_temperature(z, y, bounds=(0.005, 8.0)):
     return float(np.exp(opt.x)) if opt.success else 1.0
 
 
-def reference(n, fs, freq, harmonics=3):
+def fit_oof_temperature(z_tr, y_tr, train_blocks, bounds=(0.005, 8.0)):
+    """Calibrate training probabilities with inner-OOF temperatures and return full temperature for test."""
+    z_tr = np.asarray(z_tr, dtype=float)
+    y_tr = np.asarray(y_tr, dtype=int)
+    t_full = fit_temperature(z_tr, y_tr, bounds=bounds)
+    unique_blocks = np.unique(train_blocks)
+    if len(unique_blocks) < 2:
+        return softmax(z_tr / t_full), t_full
+
+    p_oof = np.zeros_like(z_tr)
+    for in_b in unique_blocks:
+        in_val = np.where(train_blocks == in_b)[0]
+        in_tr = np.where(train_blocks != in_b)[0]
+        if len(in_tr) < 4 or len(np.unique(y_tr[in_tr])) < 2:
+            t_in = t_full
+        else:
+            t_in = fit_temperature(z_tr[in_tr], y_tr[in_tr], bounds=bounds)
+        p_oof[in_val] = softmax(z_tr[in_val] / t_in)
+    return p_oof, t_full
+
+
+def reference(n, fs, freq, harmonics=4):
     t = np.arange(n) / fs
     hs = [h for h in range(1, int(harmonics) + 1) if freq * h < fs / 2]
     return np.column_stack([fun(2 * np.pi * freq * h * t) for h in hs for fun in (np.sin, np.cos)])
 
 
-def cca_scores(x, freqs, fs=250, harmonics=3):
+def cca_scores(x, freqs, fs=250, harmonics=4):
     x = np.asarray(x, float)
     if x.ndim != 2 or len(x) < 3 or x.shape[1] < 1:
         return np.zeros(len(freqs))
@@ -223,10 +375,25 @@ def format_window_span(win):
 
 def extract_dual_features(epochs, ons, ch_labels, occ_channels, mi_channels,
                           ssvep_window, mi_window, all_mi_bands, fbcca_bands,
-                          fb_weights, nominal_freqs, fs=DEFAULT_FS, harmonics=3,
-                          segment_index=None, extract_cca=True):
+                          fb_weights, nominal_freqs, fs=DEFAULT_FS, harmonics=4,
+                          segment_index=None, extract_cca=True,
+                          filter_mode='epoch_zerophase', mi_reref='none',
+                          mi_decouple_ssvep=False):
     """Extract MI band covariances and SSVEP CCA/FBCCA scores for independent SSVEP/MI windows."""
+    if filter_mode not in VALID_FILTER_MODES:
+        raise ValueError(f'Unknown filter_mode={filter_mode!r}; expected one of {VALID_FILTER_MODES}')
+    if mi_reref not in VALID_MI_REREF_MODES:
+        raise ValueError(f'Unknown mi_reref={mi_reref!r}; expected one of {VALID_MI_REREF_MODES}')
+
+    ch_labels = [str(c) for c in ch_labels]
+    missing = [c for c in list(mi_channels) + list(occ_channels) if c not in ch_labels]
+    if missing:
+        raise ValueError(f'Missing required channels in ch_labels: {missing}')
+
     n_trials = len(epochs)
+    if len(ons) != n_trials:
+        raise ValueError(f'Mismatched epochs ({n_trials}) and ons ({len(ons)}) lengths')
+
     ci = [ch_labels.index(c) for c in mi_channels]
     oi = [ch_labels.index(c) for c in occ_channels]
 
@@ -234,6 +401,10 @@ def extract_dual_features(epochs, ons, ch_labels, occ_channels, mi_channels,
     mi_start_s, mi_end_s = mi_window
     ss_dur_s = ss_end_s - ss_start_s
     mi_dur_s = mi_end_s - mi_start_s
+    ss_n_samp = int(round(ss_dur_s * fs))
+    mi_n_samp = int(round(mi_dur_s * fs))
+    if mi_n_samp < 3 or ss_n_samp < 3:
+        raise ValueError(f'Window sample counts must be >= 3 (got mi={mi_n_samp}, ss={ss_n_samp})')
 
     covs = np.zeros((n_trials, len(all_mi_bands), len(ci), len(ci)))
     raw_ss_fbcca = np.zeros((n_trials, len(nominal_freqs)))
@@ -241,32 +412,105 @@ def extract_dual_features(epochs, ons, ch_labels, occ_channels, mi_channels,
 
     mi_sos = [signal.butter(4, band, fs=fs, btype='bandpass', output='sos') for band in all_mi_bands]
     fb_sos = [signal.butter(4, [lo, hi], fs=fs, btype='bandpass', output='sos') for lo, hi in fbcca_bands]
+    occ_broad_band = [6.0, min(45.0, 0.45 * fs)]
+    occ_broad_sos = signal.butter(4, occ_broad_band, fs=fs, btype='bandpass', output='sos') if extract_cca else None
+    min_padlen = max(3 * (2 * sos.shape[0] + 1) for sos in (*mi_sos, *fb_sos))
+    u_proj = _ssvep_projection_basis(mi_n_samp, nominal_freqs, fs=fs) if mi_decouple_ssvep else None
 
     for i in range(n_trials):
-        ds = epochs[i]
-        on = ons[i]
+        ds = np.asarray(epochs[i], dtype=float)
+        if ds.ndim != 2 or ds.shape[1] != len(ch_labels):
+            raise ValueError(f'Trial {i} shape {ds.shape} does not match {len(ch_labels)} channels')
+        if not np.isfinite(ds).all():
+            raise ValueError(f'Trial {i} contains NaN or Inf')
 
+        on = float(ons[i])
         mi_a, mi_b = sample_bounds(on, mi_start_s, mi_dur_s, fs=fs, segment_index=segment_index)
-        x_central = ds[mi_a:mi_b, ci]
-        for b_idx, sos in enumerate(mi_sos):
-            xf = signal.sosfiltfilt(sos, x_central, axis=0)
-            covs[i, b_idx] = covariance(xf)
-
         ss_a, ss_b = sample_bounds(on, ss_start_s, ss_dur_s, fs=fs, segment_index=segment_index)
-        x_occ = ds[ss_a:ss_b, oi]
-        if extract_cca:
-            raw_ss_cca[i] = cca_scores(x_occ, nominal_freqs, fs, harmonics)
+        if not (0 <= mi_a < mi_b <= len(ds)) or (mi_b - mi_a) != mi_n_samp:
+            raise ValueError(
+                f'MI window [{mi_a}, {mi_b}) (expected {mi_n_samp} samples) out of bounds for trial {i} len={len(ds)}'
+            )
+        if not (0 <= ss_a < ss_b <= len(ds)) or (ss_b - ss_a) != ss_n_samp:
+            raise ValueError(
+                f'SSVEP window [{ss_a}, {ss_b}) (expected {ss_n_samp} samples) out of bounds for trial {i} len={len(ds)}'
+            )
 
-        fb_score = np.zeros(len(nominal_freqs))
-        for b_idx, sos in enumerate(fb_sos):
-            x_sub = signal.sosfiltfilt(sos, x_occ, axis=0)
-            fb_score += fb_weights[b_idx] * (cca_scores(x_sub, nominal_freqs, fs, harmonics) ** 2)
-        raw_ss_fbcca[i] = fb_score
+        if filter_mode == 'epoch_zerophase':
+            if len(ds) <= min_padlen:
+                raise ValueError(f'Trial {i} length {len(ds)} <= sosfiltfilt padlen {min_padlen}')
+            x_mi_src = ds[:, ci]
+            if mi_reref == 'subset_car':
+                x_mi_src = apply_subset_car(x_mi_src)
+            for b_idx, sos in enumerate(mi_sos):
+                seg_mi = signal.sosfiltfilt(sos, x_mi_src, axis=0)[mi_a:mi_b]
+                if u_proj is not None and u_proj.shape[1] > 0:
+                    seg_c = seg_mi - seg_mi.mean(axis=0, keepdims=True)
+                    seg_mi = seg_c - u_proj @ (u_proj.T @ seg_c)
+                covs[i, b_idx] = covariance(seg_mi)
+
+            x_occ_src = ds[:, oi]
+            if extract_cca:
+                x_occ_broad = signal.sosfiltfilt(occ_broad_sos, x_occ_src, axis=0)[ss_a:ss_b]
+                raw_ss_cca[i] = cca_scores(x_occ_broad, nominal_freqs, fs, harmonics)
+            fb_score = np.zeros(len(nominal_freqs))
+            for b_idx, sos in enumerate(fb_sos):
+                x_sub = signal.sosfiltfilt(sos, x_occ_src, axis=0)[ss_a:ss_b]
+                fb_score += fb_weights[b_idx] * (cca_scores(x_sub, nominal_freqs, fs, harmonics) ** 2)
+            raw_ss_fbcca[i] = fb_score
+
+        elif filter_mode == 'causal':
+            x_mi_avail = ds[:mi_b, ci]
+            if mi_reref == 'subset_car':
+                x_mi_avail = apply_subset_car(x_mi_avail)
+            x_mi_avail = x_mi_avail - x_mi_avail[0:1]
+            for b_idx, sos in enumerate(mi_sos):
+                seg_mi = signal.sosfilt(sos, x_mi_avail, axis=0)[mi_a:mi_b]
+                if u_proj is not None and u_proj.shape[1] > 0:
+                    seg_c = seg_mi - seg_mi.mean(axis=0, keepdims=True)
+                    seg_mi = seg_c - u_proj @ (u_proj.T @ seg_c)
+                covs[i, b_idx] = covariance(seg_mi)
+
+            x_occ_avail = ds[:ss_b, oi]
+            x_occ_avail = x_occ_avail - x_occ_avail[0:1]
+            if extract_cca:
+                x_occ_broad = signal.sosfilt(occ_broad_sos, x_occ_avail, axis=0)[ss_a:ss_b]
+                raw_ss_cca[i] = cca_scores(x_occ_broad, nominal_freqs, fs, harmonics)
+            fb_score = np.zeros(len(nominal_freqs))
+            for b_idx, sos in enumerate(fb_sos):
+                x_sub = signal.sosfilt(sos, x_occ_avail, axis=0)[ss_a:ss_b]
+                fb_score += fb_weights[b_idx] * (cca_scores(x_sub, nominal_freqs, fs, harmonics) ** 2)
+            raw_ss_fbcca[i] = fb_score
+
+        else:  # window_zerophase
+            if mi_n_samp <= min_padlen or ss_n_samp <= min_padlen:
+                raise ValueError(
+                    f'Window length (mi={mi_n_samp}, ss={ss_n_samp}) <= sosfiltfilt padlen {min_padlen}'
+                )
+            x_central = ds[mi_a:mi_b, ci]
+            if mi_reref == 'subset_car':
+                x_central = apply_subset_car(x_central)
+            for b_idx, sos in enumerate(mi_sos):
+                seg_mi = signal.sosfiltfilt(sos, x_central, axis=0)
+                if u_proj is not None and u_proj.shape[1] > 0:
+                    seg_c = seg_mi - seg_mi.mean(axis=0, keepdims=True)
+                    seg_mi = seg_c - u_proj @ (u_proj.T @ seg_c)
+                covs[i, b_idx] = covariance(seg_mi)
+
+            x_occ = ds[ss_a:ss_b, oi]
+            if extract_cca:
+                x_occ_broad = signal.sosfiltfilt(occ_broad_sos, x_occ, axis=0)
+                raw_ss_cca[i] = cca_scores(x_occ_broad, nominal_freqs, fs, harmonics)
+            fb_score = np.zeros(len(nominal_freqs))
+            for b_idx, sos in enumerate(fb_sos):
+                x_sub = signal.sosfiltfilt(sos, x_occ, axis=0)
+                fb_score += fb_weights[b_idx] * (cca_scores(x_sub, nominal_freqs, fs, harmonics) ** 2)
+            raw_ss_fbcca[i] = fb_score
 
     return covs, raw_ss_fbcca, raw_ss_cca
 
 
-def accumulate_log_probs(tr_probs_list, te_probs_list, y_tr, bounds=(0.2, 8.0)):
+def accumulate_log_probs(tr_probs_list, te_probs_list, y_tr, bounds=(0.2, 8.0), train_blocks=None):
     """Accumulate Bayesian log-posteriors over 1..k segments with fold-only calibration.
 
     At k == 1, returns the exact single-segment probabilities untouched so
@@ -276,5 +520,8 @@ def accumulate_log_probs(tr_probs_list, te_probs_list, y_tr, bounds=(0.2, 8.0)):
         return tr_probs_list[0], te_probs_list[0], 1.0
     sum_tr = np.sum([logp(p) for p in tr_probs_list], axis=0)
     sum_te = np.sum([logp(p) for p in te_probs_list], axis=0)
+    if train_blocks is not None:
+        acc_tr, temp = fit_oof_temperature(sum_tr, y_tr, train_blocks, bounds=bounds)
+        return acc_tr, softmax(sum_te / temp), temp
     temp = fit_temperature(sum_tr, y_tr, bounds=bounds)
     return softmax(sum_tr / temp), softmax(sum_te / temp), temp

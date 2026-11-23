@@ -21,14 +21,18 @@ from diagnostics import Diagnostics
 from channel_selection import MI_POOLS, select_channels
 from windowing import (
     accumulate_log_probs,
+    align_proba_4class,
+    apply_cov_car,
     cca_scores,
     covariance,
     extract_dual_features,
+    fit_oof_temperature,
     fit_temperature,
     format_window_span,
     logp,
     reference,
     softmax,
+    validate_subject_cache,
 )
 import time
 import numpy as np
@@ -42,7 +46,7 @@ from pyriemann.tangentspace import TangentSpace
 
 # Constants
 FS = 250
-HARMONICS = 3
+HARMONICS = 4
 NOMINAL_FREQUENCIES = [12.0, 10.0, 60.0 / 7.0, 7.5]  # thumb, index, middle, little
 CLASS_NAMES = ['thumb', 'index', 'middle', 'little']
 
@@ -50,7 +54,7 @@ CENTRAL = ['C3', 'C4', 'FC3', 'FC4', 'CP3', 'CP4', 'C1', 'C2', 'C5', 'C6',
            'FC1', 'FC2', 'FC5', 'FC6', 'CP1', 'CP2', 'CP5', 'CP6']
 OCC2 = ['O1', 'O2']
 
-FBCCA_BANDS = [(6, 45), (10, 45), (14, 45), (18, 45), (22, 45)]
+FBCCA_BANDS = [(6, 45), (9, 45), (14, 45), (18, 45), (21, 45)]
 FB_WEIGHTS = np.arange(1, len(FBCCA_BANDS) + 1)**(-1.25) + 0.25
 
 MI_BROAD_BAND = (8, 30)
@@ -59,26 +63,33 @@ ALL_MI_BANDS = [MI_BROAD_BAND] + MI_SUB_BANDS
 
 
 def shrink(c, amount=0.1):
-    c = np.asarray(c)
+    c = np.asarray(c, dtype=float)
     n = c.shape[-1]
-    return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / n
+    return (1 - amount) * c + amount * np.trace(c, axis1=-2, axis2=-1)[..., None, None] * np.eye(n) / max(n, 1)
 
 
 def normtrace(c):
     return c / np.maximum(np.trace(c, axis1=-2, axis2=-1)[..., None, None], 1e-12)
 
+
 # MI Models
 class FBPowerLDAModel:
+    @staticmethod
+    def _features(covs):
+        c_sub = normtrace(covs[:, 1:])
+        return np.log(np.maximum(np.diagonal(c_sub, axis1=-2, axis2=-1), 1e-12)).reshape(len(covs), -1)
+
     def fit(self, covs, y):
-        x = np.log(np.maximum(np.diagonal(covs[:, 1:], axis1=-2, axis2=-1), 1e-12)).reshape(len(covs), -1)
+        x = self._features(covs)
         self.scaler = StandardScaler().fit(x)
         self.clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=0.5).fit(self.scaler.transform(x), y)
         return self
 
     def predict_proba(self, covs):
-        x = np.log(np.maximum(np.diagonal(covs[:, 1:], axis1=-2, axis2=-1), 1e-12)).reshape(len(covs), -1)
+        x = self._features(covs)
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class FBCSPLDAModel:
     def __init__(self, k=8, reg=0.1):
@@ -87,24 +98,31 @@ class FBCSPLDAModel:
 
     def fit(self, covs, y):
         self.filters_ = []
+        c_dim = covs.shape[-1]
+        eye_ch = np.eye(c_dim, dtype=float)
         for band in range(1, len(ALL_MI_BANDS)):
             z = normtrace(covs[:, band])
             sub_filters = []
             for label in range(4):
-                a = shrink(z[y == label].mean(0), self.reg)
-                b = shrink(z[y != label].mean(0), self.reg)
+                m_pos = (y == label)
+                m_neg = ~m_pos
+                if not np.any(m_pos) or not np.any(m_neg):
+                    sub_filters.extend([eye_ch[0], eye_ch[-1]])
+                    continue
+                a = shrink(z[m_pos].mean(0), self.reg) + 1e-6 * eye_ch
+                b = shrink(z[m_neg].mean(0), self.reg) + 1e-6 * eye_ch
                 _, w = linalg.eigh(a, a + b)
                 sub_filters.extend([w[:, 0], w[:, -1]])
             self.filters_.append(np.array(sub_filters))
 
-        x = self._features(covs)
+        x = self._raw_features(covs)
         self.sel = SelectKBest(f_classif, k=min(self.k, x.shape[1])).fit(x, y)
         x_sel = self.sel.transform(x)
         self.scaler = StandardScaler().fit(x_sel)
         self.clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=0.5).fit(self.scaler.transform(x_sel), y)
         return self
 
-    def _features(self, covs):
+    def _raw_features(self, covs):
         feats = []
         for band in range(1, len(ALL_MI_BANDS)):
             w = self.filters_[band - 1]
@@ -113,21 +131,34 @@ class FBCSPLDAModel:
             feats.append(f)
         return np.concatenate(feats, axis=1)
 
+    def _features(self, covs):
+        return self._raw_features(covs)
+
     def predict_proba(self, covs):
-        x_sel = self.sel.transform(self._features(covs))
+        x_sel = self.sel.transform(self._raw_features(covs))
         p = self.clf.predict_proba(self.scaler.transform(x_sel))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class RCSPModel:
     def fit(self, covs, y):
         c_broad = normtrace(covs[:, 0])
         c_dim = covs.shape[-1]
+        eye_ch = np.eye(c_dim, dtype=float)
         filters = []
         for lab in range(4):
-            a = shrink(c_broad[y == lab].mean(0), 0.1)
-            b = shrink(c_broad[y != lab].mean(0), 0.1)
+            m_pos = (y == lab)
+            m_neg = ~m_pos
+            if not np.any(m_pos) or not np.any(m_neg):
+                if c_dim >= 6:
+                    filters.extend([eye_ch[0], eye_ch[min(1, c_dim - 1)], eye_ch[max(c_dim - 2, 0)], eye_ch[-1]])
+                else:
+                    filters.extend([eye_ch[0], eye_ch[-1]])
+                continue
+            a = shrink(c_broad[m_pos].mean(0), 0.1) + 1e-6 * eye_ch
+            b = shrink(c_broad[m_neg].mean(0), 0.1) + 1e-6 * eye_ch
             _, w = linalg.eigh(a, a + b)
-            if c_dim >= 4:
+            if c_dim >= 6:
                 filters.extend([w[:, 0], w[:, 1], w[:, -2], w[:, -1]])
             else:
                 filters.extend([w[:, 0], w[:, -1]])
@@ -141,20 +172,23 @@ class RCSPModel:
         c_broad = normtrace(covs[:, 0])
         x = np.log(np.maximum(np.einsum('kc,ncd,kd->nk', self.w, c_broad, self.w), 1e-12))
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 class TangentLogRegModel:
     def fit(self, covs, y):
+        c_broad = shrink(normtrace(covs[:, 0]), 0.1) + 1e-6 * np.eye(covs.shape[-1])
         self.ts = TangentSpace(metric='riemann', tsupdate=False)
-        x = self.ts.fit_transform(shrink(covs[:, 0], 0.1))
+        x = self.ts.fit_transform(c_broad)
         self.scaler = StandardScaler().fit(x)
         self.clf = LogisticRegression(C=0.1, max_iter=2000).fit(self.scaler.transform(x), y)
         return self
 
     def predict_proba(self, covs):
-        x = self.ts.transform(shrink(covs[:, 0], 0.1))
+        c_broad = shrink(normtrace(covs[:, 0]), 0.1) + 1e-6 * np.eye(covs.shape[-1])
+        x = self.ts.transform(c_broad)
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
 
 # Factory of candidate MI models
 MI_CANDIDATE_FACTORIES = {
@@ -179,15 +213,18 @@ def fit_evidence(ps, pm, y_t):
 def predict_evidence(ps, pm, coef):
     return softmax(coef[0]*logp(ps) + coef[1]*logp(pm) + coef[2:])
 
-def true_oof_fusion_gain(ps_tr_base, cand_oof_m, y_tr, tr_blocks, ps_tr_fb):
-    """Evaluate fusion gain strictly on inner training blocks out-of-fold."""
+def true_oof_fusion_gain(ps_tr_base, cand_oof_m, y_tr, tr_blocks, margin_thresh=0.6):
+    """Evaluate gated fusion gain strictly on inner training blocks out-of-fold against ps_tr_base."""
     n_tr = len(y_tr)
     p_ev_oof = np.zeros((n_tr, 4))
+    margin_tr = np.sort(ps_tr_base, axis=1)[:, -1] - np.sort(ps_tr_base, axis=1)[:, -2]
     unique_in_blocks = np.unique(tr_blocks)
     if len(unique_in_blocks) < 2:
         full_coef = fit_evidence(ps_tr_base, cand_oof_m, y_tr)
         p_ev_oof = predict_evidence(ps_tr_base, cand_oof_m, full_coef)
-        oof_gain = float(np.mean(p_ev_oof.argmax(1) == y_tr) - np.mean(ps_tr_fb.argmax(1) == y_tr))
+        mask = margin_tr >= margin_thresh
+        p_ev_oof[mask] = ps_tr_base[mask]
+        oof_gain = float(np.mean(p_ev_oof.argmax(1) == y_tr) - np.mean(ps_tr_base.argmax(1) == y_tr))
         return oof_gain, full_coef
 
     for inner_b in unique_in_blocks:
@@ -197,11 +234,15 @@ def true_oof_fusion_gain(ps_tr_base, cand_oof_m, y_tr, tr_blocks, ps_tr_fb):
             p_ev_oof[in_te_idx] = ps_tr_base[in_te_idx]
             continue
         coef_inner = fit_evidence(ps_tr_base[in_tr_idx], cand_oof_m[in_tr_idx], y_tr[in_tr_idx])
-        p_ev_oof[in_te_idx] = predict_evidence(ps_tr_base[in_te_idx], cand_oof_m[in_te_idx], coef_inner)
+        p_ev_in = predict_evidence(ps_tr_base[in_te_idx], cand_oof_m[in_te_idx], coef_inner)
+        mask_in = margin_tr[in_te_idx] >= margin_thresh
+        p_ev_in[mask_in] = ps_tr_base[in_te_idx][mask_in]
+        p_ev_oof[in_te_idx] = p_ev_in
     oof_fusion_acc = float(np.mean(p_ev_oof.argmax(1) == y_tr))
-    fbcca_acc = float(np.mean(ps_tr_fb.argmax(1) == y_tr))
+    base_acc = float(np.mean(ps_tr_base.argmax(1) == y_tr))
     full_coef = fit_evidence(ps_tr_base, cand_oof_m, y_tr)
-    return oof_fusion_acc - fbcca_acc, full_coef
+    return oof_fusion_acc - base_acc, full_coef
+
 
 class StackFusion:
     def fit(self, ps, pm, y):
@@ -213,7 +254,8 @@ class StackFusion:
     def predict_proba(self, ps, pm):
         x = np.column_stack([logp(ps), logp(pm)])
         p = self.clf.predict_proba(self.scaler.transform(x))
-        return p[:, np.argsort(self.clf.classes_)]
+        return align_proba_4class(p, self.clf.classes_)
+
 
 def _safe_floor_params(n_mi, n_ss, dur):
     if n_mi <= 2:
@@ -237,16 +279,16 @@ def _init_pred_buffers(n_trials, extended_meta=False):
         'fusion_evidence_auto_adaptive', 'fusion_stack_auto_adaptive', 'fusion_fixed_auto_adaptive',
     ]
     if extended_meta:
-        keys.extend(['fusion_evidence_fbcsp_raw', 'fusion_evidence_auto_raw'])
+        keys.extend(['ss_fbcca_cca_synergy', 'fusion_evidence_fbcsp_raw', 'fusion_evidence_auto_raw'])
     return {k: np.zeros(n_trials) for k in keys}
 
 
-def _apply_safe_evidence(ps_tr_base, ps_te_base, ps_tr, ps_te, pm_tr, pm_te,
+def _apply_safe_evidence(ps_tr_base, ps_te_base, pm_tr, pm_te,
                          y_tr, train_blocks, mi_score, min_gain, min_mi_acc, margin_te):
-    oof_gain, coef = true_oof_fusion_gain(ps_tr_base, pm_tr, y_tr, train_blocks, ps_tr)
+    oof_gain, coef = true_oof_fusion_gain(ps_tr_base, pm_tr, y_tr, train_blocks)
     p_ev_raw = predict_evidence(ps_te_base, pm_te, coef)
     if oof_gain < min_gain or mi_score < min_mi_acc:
-        return ps_te.argmax(axis=1), ps_te.copy(), p_ev_raw, oof_gain, coef
+        return ps_te_base.argmax(axis=1), ps_te_base.copy(), p_ev_raw, oof_gain, coef
     p_ev = p_ev_raw.copy()
     final = p_ev.argmax(axis=1)
     mask = margin_te >= 0.6
@@ -255,13 +297,11 @@ def _apply_safe_evidence(ps_tr_base, ps_te_base, ps_tr, ps_te, pm_tr, pm_te,
     return final, p_ev, p_ev_raw, oof_gain, coef
 
 
-def _calibrate_ssvep_part(raw_ss_fbcca, raw_ss_cca, y_tr, tr, te, ssvep_start_s, ss_dur):
-    ts_fb = fit_temperature(raw_ss_fbcca[tr], y_tr, (0.005, 2.0))
-    ps_tr = softmax(raw_ss_fbcca[tr] / ts_fb)
+def _calibrate_ssvep_part(raw_ss_fbcca, raw_ss_cca, y_tr, train_blocks, tr, te, ssvep_start_s, ss_dur):
+    ps_tr, ts_fb = fit_oof_temperature(raw_ss_fbcca[tr], y_tr, train_blocks, bounds=(0.005, 2.0))
     ps_te = softmax(raw_ss_fbcca[te] / ts_fb)
 
-    ts_c = fit_temperature(raw_ss_cca[tr], y_tr, (0.005, 2.0))
-    ps_cca_tr = softmax(raw_ss_cca[tr] / ts_c)
+    ps_cca_tr, ts_c = fit_oof_temperature(raw_ss_cca[tr], y_tr, train_blocks, bounds=(0.005, 2.0))
     ps_cca_te = softmax(raw_ss_cca[te] / ts_c)
 
     # Dual-SSVEP synergy: broadband CCA stabilizes few-lead FBCCA in short windows.
@@ -286,7 +326,7 @@ def _calibrate_fold(raw_ss_fbcca, raw_ss_cca, covs_fold, y, blocks, tr, te,
     y_tr = y[tr]
     train_blocks = blocks[tr]
     out = ss_part if ss_part is not None else _calibrate_ssvep_part(
-        raw_ss_fbcca, raw_ss_cca, y_tr, tr, te, ssvep_start_s, ss_dur,
+        raw_ss_fbcca, raw_ss_cca, y_tr, train_blocks, tr, te, ssvep_start_s, ss_dur,
     )
 
     candidate_oof, candidate_test, candidate_scores, candidate_temperatures = {}, {}, {}, {}
@@ -298,8 +338,7 @@ def _calibrate_fold(raw_ss_fbcca, raw_ss_cca, covs_fold, y, blocks, tr, te,
             sub_m = m_cls().fit(covs_fold[tr[in_tr]], y_tr[in_tr])
             oof_m[in_val] = sub_m.predict_proba(covs_fold[tr[in_val]])
 
-        tm_m = fit_temperature(logp(oof_m), y_tr, (0.25, 8.0))
-        pm_tr_m = softmax(logp(oof_m) / tm_m)
+        pm_tr_m, tm_m = fit_oof_temperature(logp(oof_m), y_tr, train_blocks, bounds=(0.25, 8.0))
         candidate_oof[m_key] = pm_tr_m
         candidate_temperatures[m_key] = tm_m
         candidate_scores[m_key] = float(np.mean(pm_tr_m.argmax(axis=1) == y_tr))
@@ -319,7 +358,7 @@ def _calibrate_fold(raw_ss_fbcca, raw_ss_cca, covs_fold, y, blocks, tr, te,
 def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
                      prior_m_name, floor_dur_s, n_mi_channels, context,
                      diagnostic, preds, te, extended_meta=False):
-    ps_tr, ps_te = fold_data['ps_tr'], fold_data['ps_te']
+    ps_te = fold_data['ps_te']
     ps_tr_base, ps_te_base = fold_data['ps_tr_base'], fold_data['ps_te_base']
     ps_cca_te = fold_data['ps_cca_te']
     cand_oof, cand_test = fold_data['candidate_oof'], fold_data['candidate_test']
@@ -327,6 +366,8 @@ def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
 
     preds['ss_fbcca'][te] = ps_te.argmax(axis=1)
     preds['ss_cca'][te] = ps_cca_te.argmax(axis=1)
+    if extended_meta:
+        preds['ss_fbcca_cca_synergy'][te] = ps_te_base.argmax(axis=1)
     preds['mi_fbcsp'][te] = cand_test['fbcsp'].argmax(axis=1)
     preds['mi_fbpower'][te] = cand_test['fbpower_lda'].argmax(axis=1)
 
@@ -346,7 +387,7 @@ def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
     # Track 1: Generic FBCSP
     pm_fbcsp_tr, pm_fbcsp_te = cand_oof['fbcsp'], cand_test['fbcsp']
     final_fbcsp, p_ev_fbcsp, p_ev_fbcsp_raw, oof_gain_fixed, _ = _apply_safe_evidence(
-        ps_tr_base, ps_te_base, ps_tr, ps_te, pm_fbcsp_tr, pm_fbcsp_te,
+        ps_tr_base, ps_te_base, pm_fbcsp_tr, pm_fbcsp_te,
         y_tr, train_blocks, cand_scores['fbcsp'], min_gain, min_mi_acc, margin_te,
     )
     preds['fusion_evidence_fbcsp'][te] = final_fbcsp
@@ -357,7 +398,7 @@ def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
 
     # Track 2: Subject-Specific Prior Best
     final_prior, p_ev_prior, _, _, _ = _apply_safe_evidence(
-        ps_tr_base, ps_te_base, ps_tr, ps_te, pm_prior_tr, pm_prior_te,
+        ps_tr_base, ps_te_base, pm_prior_tr, pm_prior_te,
         y_tr, train_blocks, cand_scores[prior_m_name], min_gain, min_mi_acc, margin_te,
     )
     preds['fusion_evidence_prior_best'][te] = final_prior
@@ -369,7 +410,7 @@ def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
         final_auto, p_ev_auto = final_fbcsp.copy(), p_ev_fbcsp.copy()
         p_ev_auto_raw = p_ev_fbcsp_raw.copy()
     else:
-        oof_gain_auto, coef_auto = true_oof_fusion_gain(ps_tr_base, pm_auto_tr, y_tr, train_blocks, ps_tr)
+        oof_gain_auto, coef_auto = true_oof_fusion_gain(ps_tr_base, pm_auto_tr, y_tr, train_blocks)
         p_ev_auto_raw = predict_evidence(ps_te_base, pm_auto_te, coef_auto)
         if oof_gain_auto >= oof_gain_fixed and oof_gain_auto >= min_gain and cand_scores[best_m_name] >= min_mi_acc:
             p_ev_auto = p_ev_auto_raw.copy()
@@ -386,7 +427,7 @@ def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
     preds['fusion_fixed_auto_adaptive'][te] = (0.5 * ps_te_base + 0.5 * pm_auto_te).argmax(axis=1)
 
     coefficients = {name: fit_evidence(ps_tr_base, p, y_tr) for name, p in cand_oof.items()}
-    methods = {'ss_fbcca': ps_te}
+    methods = {'ss_fbcca': ps_te, 'ss_fbcca_cca_synergy': ps_te_base}
     methods.update({f'mi_{name}': p for name, p in cand_test.items()})
     methods.update({f'evidence_{name}': predict_evidence(ps_te_base, cand_test[name], coef) for name, coef in coefficients.items()})
     methods['fusion_evidence_auto_adaptive'] = p_ev_auto
@@ -399,17 +440,23 @@ def _run_fold_fusion(fold_data, y_tr, y_te, train_blocks, trial_ids_te,
     diagnostic.predictions(context, trial_ids_te, y_te, ps_te, methods)
 
 
-def _accumulate_fold_step(seg_folds_prefix, y_tr):
+def _accumulate_fold_step(seg_folds_prefix, y_tr, train_blocks=None):
     """Aggregate calibrated segment fold predictions across segments 1..k."""
     if len(seg_folds_prefix) == 1:
         return seg_folds_prefix[0]
 
     ps_tr, ps_te, ts_acc = accumulate_log_probs(
-        [f['ps_tr'] for f in seg_folds_prefix], [f['ps_te'] for f in seg_folds_prefix], y_tr)
+        [f['ps_tr'] for f in seg_folds_prefix], [f['ps_te'] for f in seg_folds_prefix],
+        y_tr, train_blocks=train_blocks,
+    )
     ps_cca_tr, ps_cca_te, _ = accumulate_log_probs(
-        [f['ps_cca_tr'] for f in seg_folds_prefix], [f['ps_cca_te'] for f in seg_folds_prefix], y_tr)
+        [f['ps_cca_tr'] for f in seg_folds_prefix], [f['ps_cca_te'] for f in seg_folds_prefix],
+        y_tr, train_blocks=train_blocks,
+    )
     ps_tr_base, ps_te_base, _ = accumulate_log_probs(
-        [f['ps_tr_base'] for f in seg_folds_prefix], [f['ps_te_base'] for f in seg_folds_prefix], y_tr)
+        [f['ps_tr_base'] for f in seg_folds_prefix], [f['ps_te_base'] for f in seg_folds_prefix],
+        y_tr, train_blocks=train_blocks,
+    )
 
     cand_oof, cand_test, cand_scores, cand_temps = {}, {}, {}, {}
     for m_key in MI_CANDIDATE_FACTORIES:
@@ -417,6 +464,7 @@ def _accumulate_fold_step(seg_folds_prefix, y_tr):
             [f['candidate_oof'][m_key] for f in seg_folds_prefix],
             [f['candidate_test'][m_key] for f in seg_folds_prefix],
             y_tr,
+            train_blocks=train_blocks,
         )
         cand_oof[m_key] = pm_tr
         cand_test[m_key] = pm_te
@@ -474,7 +522,26 @@ def _make_diag_context(sub, meta, test_b, extended_meta, ch_cfg=None, mi_channel
     return ctx
 
 
-def _precompute_subject_fold_channels(window_configs, loaded_data, subjects, ch_cfg, diagnostic, extended_meta):
+def _resolve_subject_fold_starts(window_configs):
+    """Determine physiological reference starts independent of CLI duration or start ordering."""
+    modes = {wc['mode'] for wc in window_configs}
+    if modes & {'equal_cumulative', 'equal_segmented'}:
+        for wc in window_configs:
+            if wc['mode'] in ('equal_cumulative', 'equal_segmented'):
+                sp0 = wc['specs'][0]
+                return sp0['ssvep_window'][0], sp0['mi_window'][0]
+    if 'decoupled' in modes:
+        for wc in window_configs:
+            if wc['mode'] == 'decoupled':
+                sp0 = wc['specs'][0]
+                return sp0['ssvep_window'][0], sp0['mi_window'][0]
+    starts = sorted(wc['start_s'] for wc in window_configs)
+    start_s = 0.5 if any(abs(s - 0.5) < 1e-6 for s in starts) else starts[0]
+    return start_s, start_s
+
+
+def _precompute_subject_fold_channels(window_configs, loaded_data, subjects, ch_cfg, diagnostic,
+                                      extended_meta, signal_cfg):
     """Select personalized MI channel subsets once per outer fold strictly on training blocks."""
     mi_names = ch_cfg['mi_channels']
     n_pool = len(mi_names)
@@ -482,42 +549,55 @@ def _precompute_subject_fold_channels(window_configs, loaded_data, subjects, ch_
         return {(sub, int(test_b)): list(range(n_pool))
                 for sub in subjects for test_b in np.unique(loaded_data[sub]['blocks'])}
 
-    first_sp = window_configs[0]['specs'][0]
-    ss_start = first_sp['ssvep_window'][0]
-    mi_start = first_sp['mi_window'][0]
-    max_dur = max(sp['cum_duration_s'] for wc in window_configs for sp in wc['specs'])
-    ref_dur = min(2.0, max_dur, 4.0 - max(ss_start, mi_start))
-    ref_ss_win = (ss_start, round(ss_start + ref_dur, 6))
-    ref_mi_win = (mi_start, round(mi_start + ref_dur, 6))
-    ref_meta = {
-        'window_mode': 'subject_fold_ref',
-        'window_start_s': mi_start,
-        'duration_s': ref_dur,
-        'decision_time_s': round(max(ref_ss_win[1], ref_mi_win[1]), 6),
-        'ssvep_window': format_window_span(ref_ss_win),
-        'mi_window': format_window_span(ref_mi_win),
-        'segment_index': '',
-    }
-
+    ss_start, mi_start = _resolve_subject_fold_starts(window_configs)
+    max_anchor_start = max(ss_start, mi_start)
     print(f"Pre-selecting subject_fold channels ({ch_cfg['ch_select']}, pool={ch_cfg['mi_pool']}, "
-          f"ref MI={ref_meta['mi_window']}, SSVEP={ref_meta['ssvep_window']})...")
+          f"ssvep_start={ss_start:.2f}s, mi_start={mi_start:.2f}s)...")
     selected_map = {}
     for sub in subjects:
         s_data = loaded_data[sub]
         y, blocks, ons = s_data['y'], s_data['blocks'], s_data['ons']
+        min_post_samples = min(
+            len(s_data['epochs'][i]) - int(round(ons[i] + max_anchor_start * FS))
+            for i in range(len(y))
+        )
+        max_samples = min(int(round(2.0 * FS)), int(round((4.0 - max_anchor_start) * FS)), min_post_samples)
+        if max_samples < 3:
+            raise ValueError(f'{sub}: insufficient post-onset samples ({min_post_samples}) for subject_fold reference')
+        ref_dur = round(max_samples / FS, 6)
+        if int(round(ref_dur * FS)) > min_post_samples:
+            ref_dur = round((min_post_samples - 1) / FS, 6)
+        ref_ss_win = (ss_start, round(ss_start + ref_dur, 6))
+        ref_mi_win = (mi_start, round(mi_start + ref_dur, 6))
+        ref_meta = {
+            'window_mode': 'subject_fold_ref',
+            'window_start_s': mi_start,
+            'duration_s': ref_dur,
+            'decision_time_s': round(max(ref_ss_win[1], ref_mi_win[1]), 6),
+            'ssvep_window': format_window_span(ref_ss_win),
+            'mi_window': format_window_span(ref_mi_win),
+            'segment_index': '',
+        }
+
         covs_ref, raw_ss_fb, raw_ss_cca = extract_dual_features(
             s_data['epochs'], ons, s_data['ch_labels'], OCC2, mi_names,
             ref_ss_win, ref_mi_win, ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
             NOMINAL_FREQUENCIES, FS, HARMONICS,
+            filter_mode=signal_cfg['filter_mode'],
+            mi_reref='none',
+            mi_decouple_ssvep=signal_cfg['mi_decouple_ssvep'],
         )
         for test_b in np.unique(blocks):
             te = np.where(blocks == test_b)[0]
             tr = np.where(blocks != test_b)[0]
-            ss_part = _calibrate_ssvep_part(raw_ss_fb, raw_ss_cca, y[tr], tr, te, ss_start, ref_dur)
+            ss_part = _calibrate_ssvep_part(
+                raw_ss_fb, raw_ss_cca, y[tr], blocks[tr], tr, te, ss_start, ref_dur,
+            )
             sel = select_channels(
                 covs_ref[tr], y[tr], blocks[tr], mi_names, ps_tr=ss_part['ps_tr_base'],
                 method=ch_cfg['ch_select'], k_min=ch_cfg['ch_k_min'], k_max=ch_cfg['ch_k_max'],
                 objective=ch_cfg['ch_objective'], seed=ch_cfg['ch_seed'],
+                mi_reref=signal_cfg['mi_reref'],
             )
             selected_map[(sub, int(test_b))] = sel['indices']
             ctx = _make_diag_context(sub, ref_meta, test_b, extended_meta, ch_cfg)
@@ -529,7 +609,7 @@ def _precompute_subject_fold_channels(window_configs, loaded_data, subjects, ch_
 
 
 def _resolve_fold_subset(covs, ss_part, y, blocks, tr, test_b, sub, meta,
-                         ch_cfg, subject_fold_channels, diagnostic, extended_meta):
+                         ch_cfg, subject_fold_channels, diagnostic, extended_meta, signal_cfg):
     mi_names = ch_cfg['mi_channels']
     if ch_cfg['ch_select'] == 'none':
         return list(range(len(mi_names)))
@@ -540,6 +620,7 @@ def _resolve_fold_subset(covs, ss_part, y, blocks, tr, test_b, sub, meta,
         covs[tr], y[tr], blocks[tr], mi_names, ps_tr=ss_part['ps_tr_base'],
         method=ch_cfg['ch_select'], k_min=ch_cfg['ch_k_min'], k_max=ch_cfg['ch_k_max'],
         objective=ch_cfg['ch_objective'], seed=ch_cfg['ch_seed'],
+        mi_reref=signal_cfg['mi_reref'],
     )
     ctx = _make_diag_context(sub, meta, test_b, extended_meta, ch_cfg)
     diagnostic.channel_selection(
@@ -551,7 +632,7 @@ def _resolve_fold_subset(covs, ss_part, y, blocks, tr, test_b, sub, meta,
 
 def _evaluate_standard_spec(spec, loaded_data, subjects, subject_prior_best,
                             diagnostic, all_records, extended_meta,
-                            ch_cfg, subject_fold_channels):
+                            ch_cfg, subject_fold_channels, signal_cfg):
     t_dur = time.time()
     ss_win = spec['ssvep_window']
     mi_win = spec['mi_window']
@@ -576,6 +657,9 @@ def _evaluate_standard_spec(spec, loaded_data, subjects, subject_prior_best,
             s_data['epochs'], ons, s_data['ch_labels'], OCC2, mi_names,
             ss_win, mi_win, ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
             NOMINAL_FREQUENCIES, FS, HARMONICS,
+            filter_mode=signal_cfg['filter_mode'],
+            mi_reref='none',
+            mi_decouple_ssvep=signal_cfg['mi_decouple_ssvep'],
         )
         preds = _init_pred_buffers(len(y), extended_meta=extended_meta)
         prior_m_name = subject_prior_best.get(sub, 'fbcsp')
@@ -583,12 +667,14 @@ def _evaluate_standard_spec(spec, loaded_data, subjects, subject_prior_best,
         for test_b in np.unique(blocks):
             te = np.where(blocks == test_b)[0]
             tr = np.where(blocks != test_b)[0]
-            ss_part = _calibrate_ssvep_part(raw_ss_fbcca, raw_ss_cca, y[tr], tr, te, ss_win[0], ss_dur)
+            ss_part = _calibrate_ssvep_part(raw_ss_fbcca, raw_ss_cca, y[tr], blocks[tr], tr, te, ss_win[0], ss_dur)
             sub_idx = _resolve_fold_subset(
                 covs, ss_part, y, blocks, tr, test_b, sub, meta,
-                ch_cfg, subject_fold_channels, diagnostic, extended_meta,
+                ch_cfg, subject_fold_channels, diagnostic, extended_meta, signal_cfg,
             )
             covs_fold = covs[:, :, sub_idx, :][:, :, :, sub_idx]
+            if signal_cfg['mi_reref'] == 'subset_car':
+                covs_fold = apply_cov_car(covs_fold)
             fold_data = _calibrate_fold(
                 raw_ss_fbcca, raw_ss_cca, covs_fold, y, blocks, tr, te,
                 ss_win[0], ss_dur, ss_part=ss_part,
@@ -606,7 +692,7 @@ def _evaluate_standard_spec(spec, loaded_data, subjects, subject_prior_best,
 
 def _evaluate_segmented_group(w_conf, loaded_data, subjects, subject_prior_best,
                               diagnostic, all_records, extended_meta,
-                              ch_cfg, subject_fold_channels):
+                              ch_cfg, subject_fold_channels, signal_cfg):
     specs = w_conf['specs']
     n_segs = len(specs)
     step_s = specs[0]['duration_s']
@@ -626,6 +712,9 @@ def _evaluate_segmented_group(w_conf, loaded_data, subjects, subject_prior_best,
                 s_data['epochs'], ons, s_data['ch_labels'], OCC2, mi_names,
                 sp['ssvep_window'], sp['mi_window'], ALL_MI_BANDS, FBCCA_BANDS, FB_WEIGHTS,
                 NOMINAL_FREQUENCIES, FS, HARMONICS, segment_index=sp['segment_index'],
+                filter_mode=signal_cfg['filter_mode'],
+                mi_reref='none',
+                mi_decouple_ssvep=signal_cfg['mi_decouple_ssvep'],
             )
             for sp in specs
         ]
@@ -666,13 +755,15 @@ def _evaluate_segmented_group(w_conf, loaded_data, subjects, subject_prior_best,
             for k, sp in enumerate(specs):
                 covs_k, raw_fb_k, raw_cca_k = seg_features[k]
                 ss_part = _calibrate_ssvep_part(
-                    raw_fb_k, raw_cca_k, y[tr], tr, te, sp['ssvep_window'][0], sp['duration_s'],
+                    raw_fb_k, raw_cca_k, y[tr], blocks[tr], tr, te, sp['ssvep_window'][0], sp['duration_s'],
                 )
                 sub_idx = _resolve_fold_subset(
                     covs_k, ss_part, y, blocks, tr, test_b, sub, step_metas[k],
-                    ch_cfg, subject_fold_channels, diagnostic, extended_meta,
+                    ch_cfg, subject_fold_channels, diagnostic, extended_meta, signal_cfg,
                 )
                 covs_fold = covs_k[:, :, sub_idx, :][:, :, :, sub_idx]
+                if signal_cfg['mi_reref'] == 'subset_car':
+                    covs_fold = apply_cov_car(covs_fold)
                 f_k = _calibrate_fold(
                     raw_fb_k, raw_cca_k, covs_fold, y, blocks, tr, te,
                     sp['ssvep_window'][0], sp['duration_s'], ss_part=ss_part,
@@ -686,7 +777,7 @@ def _evaluate_segmented_group(w_conf, loaded_data, subjects, subject_prior_best,
                     step_preds[k], te, extended_meta=extended_meta,
                 )
 
-                acc_fold = _accumulate_fold_step(fold_segs, y[tr])
+                acc_fold = _accumulate_fold_step(fold_segs, y[tr], train_blocks=blocks[tr])
                 acc_ctx = _make_diag_context(sub, accum_metas[k], test_b, extended_meta, ch_cfg)
                 _run_fold_fusion(
                     acc_fold, y[tr], y[te], blocks[tr], s_data['trial_ids'][te],
@@ -721,18 +812,20 @@ def main():
         'ch_scope': getattr(args, 'ch_scope', 'subject_fold'),
         'ch_seed': getattr(args, 'ch_seed', 42),
     }
+    signal_cfg = {
+        'filter_mode': getattr(args, 'filter_mode', 'epoch_zerophase'),
+        'mi_reref': getattr(args, 'mi_reref', 'none'),
+        'mi_decouple_ssvep': bool(getattr(args, 'mi_decouple_ssvep', False)),
+    }
 
+    required_channels = list(dict.fromkeys(OCC2 + ch_cfg['mi_channels']))
     loaded_data = {}
     for sub in subjects:
-        data = np.load(cache_dir / f'{sub}_preprocessed.npz', allow_pickle=True)
-        loaded_data[sub] = {
-            'epochs': data['ds_epochs'],
-            'y': data['y'],
-            'blocks': data['blocks'],
-            'trial_ids': data['trial_ids'],
-            'ons': data['ons'],
-            'ch_labels': list(data['ch_labels']),
-        }
+        with np.load(cache_dir / f'{sub}_preprocessed.npz', allow_pickle=True) as data:
+            parsed = validate_subject_cache(data, required_channels=required_channels, subject=sub)
+        if len(np.unique(parsed['blocks'])) < 2:
+            raise ValueError(f'Subject {sub} requires at least 2 blocks for LOBO cross-validation')
+        loaded_data[sub] = parsed
 
     window_configs = windows(args)
     extended_meta = (
@@ -749,7 +842,7 @@ def main():
     subject_fold_channels = {}
     if ch_cfg['ch_scope'] == 'subject_fold' or ch_cfg['ch_select'] == 'none':
         subject_fold_channels = _precompute_subject_fold_channels(
-            window_configs, loaded_data, subjects, ch_cfg, diagnostic, extended_meta,
+            window_configs, loaded_data, subjects, ch_cfg, diagnostic, extended_meta, signal_cfg,
         )
 
     for w_conf in window_configs:
@@ -759,13 +852,13 @@ def main():
         if w_conf['mode'] == 'equal_segmented':
             _evaluate_segmented_group(
                 w_conf, loaded_data, subjects, subject_prior_best,
-                diagnostic, all_records, extended_meta, ch_cfg, subject_fold_channels,
+                diagnostic, all_records, extended_meta, ch_cfg, subject_fold_channels, signal_cfg,
             )
         else:
             for spec in w_conf['specs']:
                 _evaluate_standard_spec(
                     spec, loaded_data, subjects, subject_prior_best,
-                    diagnostic, all_records, extended_meta, ch_cfg, subject_fold_channels,
+                    diagnostic, all_records, extended_meta, ch_cfg, subject_fold_channels, signal_cfg,
                 )
 
     diagnostic.save()

@@ -41,7 +41,17 @@ python -m venv .venv
 # 可选筛选算法：--ch-select none | rfe | ga | pso
 ```
 
-缓存文件名为 `YDL_preprocessed.npz`、`YZL_preprocessed.npz`、`FHY_preprocessed.npz`。必需字段：`ds_epochs`（试次×时间×通道，250 Hz）、`y`（0–3，thumb/index/middle/little）、`blocks`、`trial_ids`、`ons`（降采样后的起点样本索引）、`ch_labels`。每个训练划分必须覆盖四类；缓存须包含足够窗口长度与所需通道。只加载可信缓存，原实现使用 `allow_pickle=True`。预处理生成器不在本仓库范围内。
+### 滤波、空间重参考与谐波解耦 (`--filter-mode`, `--mi-reref`, `--mi-decouple-ssvep`)
+
+默认在整段试次上执行零相位带通后再切窗（`--filter-mode epoch_zerophase`），消除 0.5s 短窗及连续分段中的 IIR 边界振铃失真；也可切换为严格单向无未来泄漏的因果滤波（`causal`）或旧版先切片再滤波模式（`window_zerophase`）。此外支持子集内局部共平均参考（`--mi-reref subset_car`，严禁跨未选中通道）与中央区 SSVEP 谐波正交投影剔除消融（`--mi-decouple-ssvep`）：
+
+```powershell
+# 在线严格因果滤波 + 局部子集 CAR + SSVEP 锁相谐波正交解耦对照
+.venv/Scripts/python run_adaptive_fusion.py --cache-dir "<CACHE_DIR>" `
+  --filter-mode causal --mi-reref subset_car --mi-decouple-ssvep
+```
+
+缓存文件名为 `YDL_preprocessed.npz`、`YZL_preprocessed.npz`、`FHY_preprocessed.npz`。必需字段：`ds_epochs`（试次×时间×通道，250 Hz）、`y`（0–3，thumb/index/middle/little）、`blocks`、`trial_ids`、`ons`（降采样后的起点样本索引）、`ch_labels`。加载时自动校验字段完整、无 `NaN/Inf`、标签值域与窗口不越界；每个训练划分须覆盖四类且包含至少两个 block。只加载可信缓存，原实现使用 `allow_pickle=True`。预处理生成器不在本仓库范围内。
 
 ## 项目入口
 
@@ -66,9 +76,9 @@ python -m venv .venv
 
 ## 评估边界
 
-外层留一 block 测试，内层 MI 折外预测选模。新增候选融合只用外层训练标签拟合，外层真实标签只用于诊断统计，不反馈选模。平分保留原候选插入顺序。温度校准与融合复用外层训练信息，不能称为完全独立的逐层交叉拟合。
+外层留一 block 测试，内层 MI 折外预测选模；SSVEP 与 MI 内层 OOF 温度校准采用嵌套内层折拟合，外层测试温度采用外层训练集 OOF 拟合。新增候选融合只用外层训练标签拟合，外层真实标签只用于诊断统计，不反馈选模。平分保留原候选插入顺序。
 
-Prior-Best 映射的独立历史来源尚未核实；若由当前完整数据获得，应作为探索性参考。中央区原始信号没有排除 SSVEP 成分，不能把全部收益归因于纯 MI。
+Prior-Best 映射的独立历史来源尚未核实；若由当前完整数据获得，应作为探索性参考。默认不启用 `--mi-decouple-ssvep` 时中央区信号保留 SSVEP 谐波成分，不能把全部收益归因于纯 MI；可开启 `--mi-decouple-ssvep` 进行锁相谐波剔除对照。
 
 诊断是离线结果；不按外层测试结果挑选模型。`net_gain_count = corrections - damages = method_correct - fbcca_correct`。窗口相互重叠，不能当成独立样本做显著性判断。
 
